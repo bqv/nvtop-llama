@@ -58,6 +58,189 @@ def detect(target):
     return ("modern" if "hide_processes_list);" in c else "legacy"), h, c
 
 
+
+def gap_fix(target, variant):
+    """Reserve meter rows per GPU, not per layout, and drop the empty `LLM -`
+    band.
+
+    Without this, every header stack reserves the same meter height, so a GPU
+    with no router (the iGPU driving the displays) leaves the rows it never
+    draws into blank -- visible as a gap between device sections.
+    """
+    # ---- interface_layout_selection.h : per-device extra rows --------------
+    h = os.path.join(target, "include/nvtop/interface_layout_selection.h")
+    t = open(h).read()
+    t = sub_once(t, "                               process_field_displayed process_field_displayed,\n",
+                 "                               process_field_displayed process_field_displayed,\n"
+                 "                               const unsigned *device_extra_rows,\n", "layout proto")
+    open(h, "w").write(t)
+
+    # ---- interface_layout_selection.c ---------------------------------------
+    c = os.path.join(target, "src/interface_layout_selection.c")
+    t = open(c).read()
+    t = sub_once(t, "process_field_displayed process_displayed, struct window_position *device_positions,",
+                 "process_field_displayed process_displayed, const unsigned *device_extra_rows,\n"
+                 "                               struct window_position *device_positions,", "layout def")
+    t = sub_once(t, "  min_rows_for_header = header_stacks * device_header_rows;",
+                 "  // Extra rows (the LLM meter) are counted per header stack, and a stack is only\n"
+                 "  // as tall as its tallest member. A GPU with no meter of its own therefore\n"
+                 "  // reserves nothing, instead of leaving the rows it never draws into blank.\n"
+                 "  unsigned stack_extra_rows[MAX_CHARTS];\n"
+                 "  unsigned total_extra_rows = 0;\n"
+                 "  for (unsigned s = 0; s < header_stacks && s < MAX_CHARTS; ++s)\n"
+                 "    stack_extra_rows[s] = 0;\n"
+                 "  for (unsigned i = 0; i < devices_count; ++i) {\n"
+                 "    unsigned stack = i / num_device_per_row;\n"
+                 "    unsigned extra = device_extra_rows ? device_extra_rows[i] : 0;\n"
+                 "    if (stack < header_stacks && stack < MAX_CHARTS && extra > stack_extra_rows[stack])\n"
+                 "      stack_extra_rows[stack] = extra;\n"
+                 "  }\n"
+                 "  for (unsigned s = 0; s < header_stacks && s < MAX_CHARTS; ++s)\n"
+                 "    total_extra_rows += stack_extra_rows[s];\n"
+                 "\n"
+                 "  min_rows_for_header = header_stacks * device_header_rows + total_extra_rows;",
+                 "layout header rows")
+    t = sub_once(t,
+                 "  unsigned num_this_row = 0;\n  unsigned headerPosX = space_before_header;\n"
+                 "  unsigned headerPosY = 0;\n  for (unsigned i = 0; i < devices_count; ++i) {\n"
+                 "    device_positions[i].posX = headerPosX;\n    device_positions[i].posY = headerPosY;\n"
+                 "    device_positions[i].sizeX = device_header_cols;\n    device_positions[i].sizeY = device_header_rows;\n"
+                 "    num_this_row++;\n    if (num_this_row == num_device_per_row) {\n"
+                 "      headerPosX = space_before_header;\n"
+                 "      headerPosY += device_header_rows + space_between_header_stack;\n      num_this_row = 0;\n"
+                 "    } else {\n      headerPosX += device_header_cols + space_between_header_col;\n    }\n  }",
+                 "  unsigned num_this_row = 0;\n  unsigned headerPosX = space_before_header;\n"
+                 "  unsigned headerPosY = 0;\n  unsigned current_stack = 0;\n"
+                 "  for (unsigned i = 0; i < devices_count; ++i) {\n"
+                 "    unsigned extra = device_extra_rows ? device_extra_rows[i] : 0;\n"
+                 "    device_positions[i].posX = headerPosX;\n    device_positions[i].posY = headerPosY;\n"
+                 "    device_positions[i].sizeX = device_header_cols;\n"
+                 "    device_positions[i].sizeY = device_header_rows + extra;\n"
+                 "    num_this_row++;\n    if (num_this_row == num_device_per_row) {\n"
+                 "      headerPosX = space_before_header;\n"
+                 "      headerPosY += device_header_rows + space_between_header_stack;\n"
+                 "      if (current_stack < MAX_CHARTS)\n        headerPosY += stack_extra_rows[current_stack];\n"
+                 "      current_stack++;\n      num_this_row = 0;\n"
+                 "    } else {\n      headerPosX += device_header_cols + space_between_header_col;\n    }\n  }",
+                 "layout position loop")
+    open(c, "w").write(t)
+
+    # ---- poller + header: router test that does not need a poll ------------
+    po = os.path.join(target, "src/llm_poller.c")
+    t = open(po).read()
+    anchor = "const nvtop_model_meter_info *nvtop_model_meter_for_gpu(const char *gpu_name) {"
+    t = sub_once(t, anchor,
+                 "/* Answered from the static server config, so it is usable while the layout is\n"
+                 " * being computed, before any server has been contacted. */\n"
+                 "bool nvtop_model_meter_has_router_for_gpu(const char *gpu_name) {\n"
+                 "  servers_init();\n  if (!gpu_name || !gpu_name[0])\n    return false;\n"
+                 "  for (unsigned i = 0; i < g_def_count && i < NVTOP_LLM_MAX_SERVERS; i++) {\n"
+                 "    if (g_defs[i].gpu_hint[0] && contains_nocase(gpu_name, g_defs[i].gpu_hint))\n"
+                 "      return true;\n  }\n  return false;\n}\n\n" + anchor, "router check")
+    open(po, "w").write(t)
+
+    mh = os.path.join(target, "include/nvtop/model_meter_c.h")
+    t = open(mh).read()
+    t = sub_once(t, "void nvtop_model_meter_shutdown(void);",
+                 "/* True when a router is configured for this GPU name. Does not poll, so it can\n"
+                 " * be asked while the display is being laid out. */\n"
+                 "bool nvtop_model_meter_has_router_for_gpu(const char *gpu_name);\n\n"
+                 "void nvtop_model_meter_shutdown(void);", "router decl")
+    open(mh, "w").write(t)
+
+    # ---- interface.c: helper signature, chooser, dropped LLM - band --------
+    p2 = os.path.join(target, "src/interface.c")
+    t = open(p2).read()
+    t = sub_once(t, "                                         unsigned rows, unsigned cols, struct window_position *device_positions,",
+                 "                                         unsigned rows, unsigned cols, const unsigned *device_extra_rows,\n"
+                 "                                         struct window_position *device_positions,", "helper sig")
+    t = sub_once(t, "dwin->options.process_fields_displayed, device_positions, &dwin->num_plots, plot_positions,",
+                 "dwin->options.process_fields_displayed, device_extra_rows, device_positions, &dwin->num_plots, plot_positions,",
+                 "helper call")
+    t = sub_once(t, "static void initialize_all_windows(struct nvtop_interface *dwin) {",
+                 "/* True when a router is configured for this GPU. Independent of the poll, so it\n"
+                 " * can be asked while the layout is being computed. */\n"
+                 "static bool gpu_has_llm_router(struct nvtop_interface *dwin, unsigned dev_id) {\n"
+                 "  struct gpu_info *gpu = dwin->options.gpu_specific_opts[dev_id].linkedGpu;\n"
+                 "  return gpu && GPUINFO_STATIC_FIELD_VALID(&gpu->static_info, device_name) &&\n"
+                 "         nvtop_model_meter_has_router_for_gpu(gpu->static_info.device_name);\n"
+                 "}\n\nstatic void initialize_all_windows(struct nvtop_interface *dwin) {", "router helper")
+
+    rows_expr = "device_rows" if variant == "master" else "base_header_rows"
+    alloc_call_old = ("    alloc_device_window(device_positions[i].posY, device_positions[i].posX, "
+                      "device_positions[i].sizeX, base_header_rows,\n                        llm_rows, &dwin->devices_win[i]);")
+    alloc_call_new = ("    alloc_device_window(device_positions[i].posY, device_positions[i].posX, "
+                      "device_positions[i].sizeX, base_header_rows,\n                        device_extra_rows[i], "
+                      "&dwin->devices_win[i]);")
+    if variant == "master":
+        alloc_call_old = ("    alloc_device_window(device_positions[i].posY, device_positions[i].posX, "
+                          "device_positions[i].sizeX, &dwin->options,\n                        "
+                          "dwin->extra_info_rows, llm_rows, &dwin->devices_win[i]);")
+        alloc_call_new = ("    alloc_device_window(device_positions[i].posY, device_positions[i].posX, "
+                          "device_positions[i].sizeX, &dwin->options,\n                        "
+                          "dwin->extra_info_rows, device_extra_rows[i], &dwin->devices_win[i]);")
+
+    t = sub_once(t, "  unsigned int llm_rows = 0;\n  unsigned int baseline_plots;",
+                 "  unsigned int baseline_plots;\n\n"
+                 "  /* Meter rows are reserved per GPU, and only for GPUs that have a router: one\n"
+                 "   * without one reserves nothing, so it cannot leave a blank band behind. */\n"
+                 "  unsigned int device_extra_rows[devices_count];\n"
+                 "  for (unsigned int i = 0; i < devices_count; ++i)\n    device_extra_rows[i] = 0;",
+                 "extras array")
+    t = sub_once(t, "  for (unsigned int candidate = llm_rows_pref;; candidate--) {\n"
+                    "    compute_layout_for_interface(dwin, devices_count, " + rows_expr + " + candidate, rows, cols, device_positions,\n"
+                    "                                 plot_positions, map_device_to_plot, &process_position, &setup_position);\n"
+                    "    if (candidate == 0 || (dwin->num_plots >= baseline_plots && plot_area_rows(plot_positions, dwin->num_plots) >= 7)) {\n"
+                    "      llm_rows = candidate;\n      break;\n    }\n  }",
+                 "  for (unsigned int candidate = llm_rows_pref;; candidate--) {\n"
+                 "    for (unsigned int i = 0; i < devices_count; ++i)\n"
+                 "      device_extra_rows[i] = gpu_has_llm_router(dwin, i) ? candidate : 0;\n"
+                 "    compute_layout_for_interface(dwin, devices_count, " + rows_expr + ", rows, cols, device_extra_rows, device_positions,\n"
+                 "                                 plot_positions, map_device_to_plot, &process_position, &setup_position);\n"
+                 "    if (candidate == 0 || (dwin->num_plots >= baseline_plots && plot_area_rows(plot_positions, dwin->num_plots) >= 7))\n"
+                 "      break;\n  }", "per-device chooser")
+    t = sub_once(t, "compute_layout_for_interface(dwin, devices_count, " + rows_expr + ", rows, cols, device_positions, plot_positions,\n"
+                    "                               map_device_to_plot, &process_position, &setup_position);\n"
+                    "  baseline_plots = dwin->num_plots;",
+                 "compute_layout_for_interface(dwin, devices_count, " + rows_expr + ", rows, cols, device_extra_rows, device_positions,\n"
+                 "                               plot_positions, map_device_to_plot, &process_position, &setup_position);\n"
+                 "  baseline_plots = dwin->num_plots;", "baseline call")
+    t = sub_once(t, alloc_call_old, alloc_call_new, "alloc call")
+    band_old_commented = """      if (llm) {
+        draw_llm_meter(dev->llm_meter_win, llm);
+      } else {
+        /* No LLM router is mapped to this GPU (e.g. the iGPU driving the
+         * displays): say so rather than leaving a mysterious blank gap. */
+        werase(dev->llm_meter_win);
+        wcolor_set(dev->llm_meter_win, cyan_color, NULL);
+        mvwprintw(dev->llm_meter_win, 0, 0, "LLM");
+        wstandend(dev->llm_meter_win);
+        mvwprintw(dev->llm_meter_win, 0, 3, " -");
+        wnoutrefresh(dev->llm_meter_win);
+      }"""
+    band_old_plain = """      if (llm) {
+        draw_llm_meter(dev->llm_meter_win, llm);
+      } else {
+        werase(dev->llm_meter_win);
+        wcolor_set(dev->llm_meter_win, cyan_color, NULL);
+        mvwprintw(dev->llm_meter_win, 0, 0, "LLM");
+        wstandend(dev->llm_meter_win);
+        mvwprintw(dev->llm_meter_win, 0, 3, " -");
+        wnoutrefresh(dev->llm_meter_win);
+      }"""
+    band_new = """      if (llm)
+        draw_llm_meter(dev->llm_meter_win, llm);
+      else
+        werase(dev->llm_meter_win);"""
+    if t.count(band_old_commented) == 1:
+        t = t.replace(band_old_commented, band_new, 1)
+    else:
+        t = sub_once(t, band_old_plain, band_new, "drop empty LLM - band")
+    open(p2, "w").write(t)
+    print("  gap fix applied")
+
+
+
 def main():
     target = sys.argv[1]
     variant, hdr, iface = detect(target)
@@ -349,6 +532,7 @@ def main():
                  "target_link_libraries(nvtop\n  PRIVATE ncurses m ${CMAKE_DL_LIBS})", "cmake curl")
     open(p, "w").write(t)
 
+    gap_fix(target, variant)
     print(f"ported OK: {target}  (variant: {variant})")
 
 

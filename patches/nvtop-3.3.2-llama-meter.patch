@@ -1,6 +1,6 @@
 diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_internal_common.h
---- a/include/nvtop/interface_internal_common.h	2026-10-07 15:12:25.377579134 +0300
-+++ b/include/nvtop/interface_internal_common.h	2026-10-07 15:12:25.396493753 +0300
+--- a/include/nvtop/interface_internal_common.h	2026-10-07 16:40:36.330718498 +0300
++++ b/include/nvtop/interface_internal_common.h	2026-10-07 16:40:36.352427059 +0300
 @@ -69,6 +69,7 @@
    WINDOW *shader_cores;
    WINDOW *l2_cache_size;
@@ -9,10 +9,21 @@ diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_
    bool enc_was_visible;
    bool dec_was_visible;
    nvtop_time last_decode_seen;
+diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface_layout_selection.h
+--- a/include/nvtop/interface_layout_selection.h	2026-10-07 16:40:36.330718498 +0300
++++ b/include/nvtop/interface_layout_selection.h	2026-10-07 16:40:36.352427059 +0300
+@@ -16,6 +16,7 @@
+ void compute_sizes_from_layout(unsigned monitored_dev_count, unsigned device_header_rows, unsigned device_header_cols,
+                                unsigned rows, unsigned cols, const nvtop_interface_gpu_opts *gpu_opts,
+                                process_field_displayed process_field_displayed,
++                               const unsigned *device_extra_rows,
+                                struct window_position *device_positions, unsigned *num_plots,
+                                struct window_position plot_positions[MAX_CHARTS], unsigned *map_device_to_plot,
+                                struct window_position *process_position, struct window_position *setup_position,
 diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 --- a/include/nvtop/model_meter_c.h	1970-01-01 02:00:00.000000000 +0200
-+++ b/include/nvtop/model_meter_c.h	2026-10-07 15:12:25.397579133 +0300
-@@ -0,0 +1,95 @@
++++ b/include/nvtop/model_meter_c.h	2026-10-07 16:40:36.352427059 +0300
+@@ -0,0 +1,99 @@
 +/*
 + *
 + * Copyright (C) 2025 DSH User
@@ -105,12 +116,16 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 + * or NULL when no configured server maps to that GPU. */
 +const nvtop_model_meter_info *nvtop_model_meter_for_gpu(const char *gpu_name);
 +
++/* True when a router is configured for this GPU name. Does not poll, so it can
++ * be asked while the display is being laid out. */
++bool nvtop_model_meter_has_router_for_gpu(const char *gpu_name);
++
 +void nvtop_model_meter_shutdown(void);
 +
 +#endif /* NVTOP_MODEL_METER_C_H__ */
 diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
---- a/src/CMakeLists.txt	2026-10-07 15:12:25.384367499 +0300
-+++ b/src/CMakeLists.txt	2026-10-07 15:12:25.403055243 +0300
+--- a/src/CMakeLists.txt	2026-10-07 16:40:36.334847805 +0300
++++ b/src/CMakeLists.txt	2026-10-07 16:40:36.355357797 +0300
 @@ -16,6 +16,7 @@
    time.c
    plot.c
@@ -133,8 +148,8 @@ diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
    PRIVATE ncurses m ${CMAKE_DL_LIBS})
  
 diff -ruN a/src/interface.c b/src/interface.c
---- a/src/interface.c	2026-10-07 15:12:25.384367499 +0300
-+++ b/src/interface.c	2026-10-07 15:12:25.403055243 +0300
+--- a/src/interface.c	2026-10-07 16:40:36.334847805 +0300
++++ b/src/interface.c	2026-10-07 16:40:36.355357797 +0300
 @@ -28,6 +28,7 @@
  #include "nvtop/interface_options.h"
  #include "nvtop/interface_ring_buffer.h"
@@ -189,19 +204,20 @@ diff -ruN a/src/interface.c b/src/interface.c
  }
  
  static void alloc_process_with_option(struct nvtop_interface *interface, unsigned posX, unsigned posY, unsigned sizeX,
-@@ -350,6 +367,35 @@
+@@ -350,6 +367,44 @@
  
  static pid_t nvtop_pid;
  
 +/* One layout pass. Called a few times at startup to pick how much room the LLM
 + * meter may take without costing the plots anything. */
 +static void compute_layout_for_interface(struct nvtop_interface *dwin, unsigned devices_count, unsigned header_rows,
-+                                         unsigned rows, unsigned cols, struct window_position *device_positions,
++                                         unsigned rows, unsigned cols, const unsigned *device_extra_rows,
++                                         struct window_position *device_positions,
 +                                         struct window_position plot_positions[MAX_CHARTS],
 +                                         unsigned *map_device_to_plot, struct window_position *process_position,
 +                                         struct window_position *setup_position) {
 +  compute_sizes_from_layout(devices_count, header_rows, device_length(), rows - 1, cols, dwin->options.gpu_specific_opts,
-+                            dwin->options.process_fields_displayed, device_positions, &dwin->num_plots, plot_positions,
++                            dwin->options.process_fields_displayed, device_extra_rows, device_positions, &dwin->num_plots, plot_positions,
 +                            map_device_to_plot, process_position, setup_position, dwin->options.hide_processes_list);
 +}
 +
@@ -222,10 +238,18 @@ diff -ruN a/src/interface.c b/src/interface.c
 +  return num_plots ? bottom - top : 0;
 +}
 +
++/* True when a router is configured for this GPU. Independent of the poll, so it
++ * can be asked while the layout is being computed. */
++static bool gpu_has_llm_router(struct nvtop_interface *dwin, unsigned dev_id) {
++  struct gpu_info *gpu = dwin->options.gpu_specific_opts[dev_id].linkedGpu;
++  return gpu && GPUINFO_STATIC_FIELD_VALID(&gpu->static_info, device_name) &&
++         nvtop_model_meter_has_router_for_gpu(gpu->static_info.device_name);
++}
++
  static void initialize_all_windows(struct nvtop_interface *dwin) {
    int rows, cols;
    getmaxyx(stdscr, rows, cols);
-@@ -362,16 +408,34 @@
+@@ -362,16 +417,39 @@
    struct window_position plot_positions[MAX_CHARTS];
    struct window_position setup_position;
  
@@ -236,11 +260,16 @@ diff -ruN a/src/interface.c b/src/interface.c
 +  // Rows each GPU block really needs: 3 lines, plus a 4th for the info bar.
 +  unsigned int base_header_rows = dwin->options.has_gpu_info_bar ? 4 : 3;
 +  unsigned int llm_rows_pref = rows >= 30 ? 2u : (rows >= 22 ? 1u : 0u);
-+  unsigned int llm_rows = 0;
 +  unsigned int baseline_plots;
 +
-+  compute_layout_for_interface(dwin, devices_count, base_header_rows, rows, cols, device_positions, plot_positions,
-+                               map_device_to_plot, &process_position, &setup_position);
++  /* Meter rows are reserved per GPU, and only for GPUs that have a router: one
++   * without one reserves nothing, so it cannot leave a blank band behind. */
++  unsigned int device_extra_rows[devices_count];
++  for (unsigned int i = 0; i < devices_count; ++i)
++    device_extra_rows[i] = 0;
++
++  compute_layout_for_interface(dwin, devices_count, base_header_rows, rows, cols, device_extra_rows, device_positions,
++                               plot_positions, map_device_to_plot, &process_position, &setup_position);
 +  baseline_plots = dwin->num_plots;
 +
 +  /* Reserve rows for the LLM model meter, but only as many as the plots can
@@ -248,12 +277,12 @@ diff -ruN a/src/interface.c b/src/interface.c
 +   * plot area, falling back a row at a time and finally to no meter at all
 +   * rather than losing the graphs. */
 +  for (unsigned int candidate = llm_rows_pref;; candidate--) {
-+    compute_layout_for_interface(dwin, devices_count, base_header_rows + candidate, rows, cols, device_positions,
++    for (unsigned int i = 0; i < devices_count; ++i)
++      device_extra_rows[i] = gpu_has_llm_router(dwin, i) ? candidate : 0;
++    compute_layout_for_interface(dwin, devices_count, base_header_rows, rows, cols, device_extra_rows, device_positions,
 +                                 plot_positions, map_device_to_plot, &process_position, &setup_position);
-+    if (candidate == 0 || (dwin->num_plots >= baseline_plots && plot_area_rows(plot_positions, dwin->num_plots) >= 7)) {
-+      llm_rows = candidate;
++    if (candidate == 0 || (dwin->num_plots >= baseline_plots && plot_area_rows(plot_positions, dwin->num_plots) >= 7))
 +      break;
-+    }
 +  }
  
    alloc_plot_window(devices_count, plot_positions, map_device_to_plot, dwin);
@@ -262,11 +291,11 @@ diff -ruN a/src/interface.c b/src/interface.c
 -    alloc_device_window(device_positions[i].posY, device_positions[i].posX, device_positions[i].sizeX,
 -                        &dwin->devices_win[i]);
 +    alloc_device_window(device_positions[i].posY, device_positions[i].posX, device_positions[i].sizeX, base_header_rows,
-+                        llm_rows, &dwin->devices_win[i]);
++                        device_extra_rows[i], &dwin->devices_win[i]);
    }
  
    alloc_process_with_option(dwin, process_position.posX, process_position.posY, process_position.sizeX,
-@@ -640,6 +704,203 @@
+@@ -640,6 +718,203 @@
    }
  }
  
@@ -470,7 +499,7 @@ diff -ruN a/src/interface.c b/src/interface.c
  static void draw_devices(struct list_head *devices, struct nvtop_interface *interface) {
    struct gpu_info *device;
    unsigned dev_id = 0;
-@@ -886,6 +1147,25 @@
+@@ -886,6 +1161,17 @@
        wnoutrefresh(dev->exec_engines);
      }
  
@@ -479,24 +508,16 @@ diff -ruN a/src/interface.c b/src/interface.c
 +      const nvtop_model_meter_info *llm = NULL;
 +      if (GPUINFO_STATIC_FIELD_VALID(&device->static_info, device_name))
 +        llm = nvtop_model_meter_for_gpu(device->static_info.device_name);
-+      if (llm) {
++      if (llm)
 +        draw_llm_meter(dev->llm_meter_win, llm);
-+      } else {
-+        /* No LLM router is mapped to this GPU (e.g. the iGPU driving the
-+         * displays): say so rather than leaving a mysterious blank gap. */
++      else
 +        werase(dev->llm_meter_win);
-+        wcolor_set(dev->llm_meter_win, cyan_color, NULL);
-+        mvwprintw(dev->llm_meter_win, 0, 0, "LLM");
-+        wstandend(dev->llm_meter_win);
-+        mvwprintw(dev->llm_meter_win, 0, 3, " -");
-+        wnoutrefresh(dev->llm_meter_win);
-+      }
 +    }
 +
      dev_id++;
    }
  }
-@@ -1831,6 +2111,9 @@
+@@ -1831,6 +2117,9 @@
  
  void draw_gpu_info_ncurses(unsigned devices_count, struct list_head *devices, struct nvtop_interface *interface) {
  
@@ -506,10 +527,70 @@ diff -ruN a/src/interface.c b/src/interface.c
    draw_devices(devices, interface);
    if (!interface->setup_win.visible) {
      draw_plots(interface);
+diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
+--- a/src/interface_layout_selection.c	2026-10-07 16:40:36.337385163 +0300
++++ b/src/interface_layout_selection.c	2026-10-07 16:40:36.355357797 +0300
+@@ -232,7 +232,8 @@
+ }
+ void compute_sizes_from_layout(unsigned devices_count, unsigned device_header_rows, unsigned device_header_cols,
+                                unsigned rows, unsigned cols, const nvtop_interface_gpu_opts *gpuOpts,
+-                               process_field_displayed process_displayed, struct window_position *device_positions,
++                               process_field_displayed process_displayed, const unsigned *device_extra_rows,
++                               struct window_position *device_positions,
+                                unsigned *num_plots, struct window_position plot_positions[MAX_CHARTS],
+                                unsigned *map_device_to_plot, struct window_position *process_position,
+                                struct window_position *setup_position, bool process_win_hide) {
+@@ -242,7 +243,23 @@
+   header_stacks = max(1, devices_count / num_device_per_row + ((devices_count % num_device_per_row) > 0));
+   if (devices_count % header_stacks == 0)
+     num_device_per_row = devices_count / header_stacks;
+-  min_rows_for_header = header_stacks * device_header_rows;
++  // Extra rows (the LLM meter) are counted per header stack, and a stack is only
++  // as tall as its tallest member. A GPU with no meter of its own therefore
++  // reserves nothing, instead of leaving the rows it never draws into blank.
++  unsigned stack_extra_rows[MAX_CHARTS];
++  unsigned total_extra_rows = 0;
++  for (unsigned s = 0; s < header_stacks && s < MAX_CHARTS; ++s)
++    stack_extra_rows[s] = 0;
++  for (unsigned i = 0; i < devices_count; ++i) {
++    unsigned stack = i / num_device_per_row;
++    unsigned extra = device_extra_rows ? device_extra_rows[i] : 0;
++    if (stack < header_stacks && stack < MAX_CHARTS && extra > stack_extra_rows[stack])
++      stack_extra_rows[stack] = extra;
++  }
++  for (unsigned s = 0; s < header_stacks && s < MAX_CHARTS; ++s)
++    total_extra_rows += stack_extra_rows[s];
++
++  min_rows_for_header = header_stacks * device_header_rows + total_extra_rows;
+ 
+   unsigned min_rows_for_process =
+       process_field_displayed_count(process_displayed) ? min_rows_taken_by_process(rows, devices_count) : 0;
+@@ -314,15 +331,20 @@
+   unsigned num_this_row = 0;
+   unsigned headerPosX = space_before_header;
+   unsigned headerPosY = 0;
++  unsigned current_stack = 0;
+   for (unsigned i = 0; i < devices_count; ++i) {
++    unsigned extra = device_extra_rows ? device_extra_rows[i] : 0;
+     device_positions[i].posX = headerPosX;
+     device_positions[i].posY = headerPosY;
+     device_positions[i].sizeX = device_header_cols;
+-    device_positions[i].sizeY = device_header_rows;
++    device_positions[i].sizeY = device_header_rows + extra;
+     num_this_row++;
+     if (num_this_row == num_device_per_row) {
+       headerPosX = space_before_header;
+       headerPosY += device_header_rows + space_between_header_stack;
++      if (current_stack < MAX_CHARTS)
++        headerPosY += stack_extra_rows[current_stack];
++      current_stack++;
+       num_this_row = 0;
+     } else {
+       headerPosX += device_header_cols + space_between_header_col;
 diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 --- a/src/llm_poller.c	1970-01-01 02:00:00.000000000 +0200
-+++ b/src/llm_poller.c	2026-10-07 15:12:25.404245800 +0300
-@@ -0,0 +1,652 @@
++++ b/src/llm_poller.c	2026-10-07 16:40:36.355357797 +0300
+@@ -0,0 +1,665 @@
 +/*
 + *
 + * Copyright (C) 2025 DSH User
@@ -1142,6 +1223,19 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +  return false;
 +}
 +
++/* Answered from the static server config, so it is usable while the layout is
++ * being computed, before any server has been contacted. */
++bool nvtop_model_meter_has_router_for_gpu(const char *gpu_name) {
++  servers_init();
++  if (!gpu_name || !gpu_name[0])
++    return false;
++  for (unsigned i = 0; i < g_def_count && i < NVTOP_LLM_MAX_SERVERS; i++) {
++    if (g_defs[i].gpu_hint[0] && contains_nocase(gpu_name, g_defs[i].gpu_hint))
++      return true;
++  }
++  return false;
++}
++
 +const nvtop_model_meter_info *nvtop_model_meter_for_gpu(const char *gpu_name) {
 +  if (!g_ready || !gpu_name || !gpu_name[0])
 +    return NULL;
@@ -1163,8 +1257,8 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +  g_ready = false;
 +}
 diff -ruN a/src/nvtop.c b/src/nvtop.c
---- a/src/nvtop.c	2026-10-07 15:12:25.384367499 +0300
-+++ b/src/nvtop.c	2026-10-07 15:12:25.403055243 +0300
+--- a/src/nvtop.c	2026-10-07 16:40:36.337385163 +0300
++++ b/src/nvtop.c	2026-10-07 16:40:36.355357797 +0300
 @@ -24,6 +24,7 @@
  #include "nvtop/interface.h"
  #include "nvtop/interface_common.h"
