@@ -122,6 +122,38 @@ copies the two new files in and applies every edit by asserted anchor, so an
 unrecognised tree fails loudly instead of producing broken code. Then diff the
 result against the pristine tree to make the patch.
 
+## Cold-load progress
+
+While a model is loading, the meter shows how far the load has got:
+
+    LLM llama  loading  Qwen3.5-35B-A3B-UD-IQ4_XS-240k
+    LOAD[||||||||         ]  38%  6.2/16.3 GiB  780 MB/s  eta 13s
+
+This is not an API signal -- llama.cpp's router only reports `loading` or
+`loaded`, never a number. nvtop reads `read_bytes` from `/proc/<pid>/io` for the
+per-model `llama-server` child (the one carrying `--model`; the router carries
+`--models-dir` instead) and divides it by the size of the GGUF that child was
+told to load.
+
+That is only a valid signal because `models.ini` sets `load-mode = dio`:
+DirectIO sends every byte through the block layer, so `read_bytes` advances in
+step with the load. Under the default mmap loading the counter stalls while pages
+are served from page cache and the percentage would be a lie -- so a counter that
+has stopped moving is reported as
+
+    LOAD[]  no read progress (load-mode not dio?)
+
+rather than as a frozen bar. Two related traps, both handled: `read_bytes` also
+counts the process's other reads (shared libraries, the vocab, a second pass over
+the header), so it can exceed the file size, and both the percentage and the
+displayed size are clamped; and 100% means "the weights have been read", not "the
+model is serving", so the bar only appears while the router still reports the
+model as loading.
+
+The test for this is `tests/load-test.py`, driven by the `tests/fake-load.c`
+fixture: a stub router claims a model is loading while a fake `llama-server`
+child does real `O_DIRECT` reads of a GGUF. No model server is involved.
+
 ## Tests
 
 - `tests/stub-test.py` — serves a canned router (two models running, one

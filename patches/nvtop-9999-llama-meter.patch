@@ -1,6 +1,6 @@
 diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_internal_common.h
---- a/include/nvtop/interface_internal_common.h	2026-10-07 16:40:36.976869760 +0300
-+++ b/include/nvtop/interface_internal_common.h	2026-10-07 16:40:36.992845533 +0300
+--- a/include/nvtop/interface_internal_common.h	2026-10-07 22:33:17.816841681 +0300
++++ b/include/nvtop/interface_internal_common.h	2026-10-07 22:33:17.838933005 +0300
 @@ -82,6 +82,7 @@
    // Generic grid of extra GPU information (clock domains and static specs); each
    // cell holds one "NAME value" field. Unused slots are NULL.
@@ -10,8 +10,8 @@ diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_
    bool dec_was_visible;
    nvtop_time last_decode_seen;
 diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface_layout_selection.h
---- a/include/nvtop/interface_layout_selection.h	2026-10-07 16:40:36.976869760 +0300
-+++ b/include/nvtop/interface_layout_selection.h	2026-10-07 16:40:36.992845533 +0300
+--- a/include/nvtop/interface_layout_selection.h	2026-10-07 22:33:17.816841681 +0300
++++ b/include/nvtop/interface_layout_selection.h	2026-10-07 22:33:17.838933005 +0300
 @@ -16,6 +16,7 @@
  void compute_sizes_from_layout(unsigned monitored_dev_count, unsigned device_header_rows, unsigned device_header_cols,
                                 unsigned rows, unsigned cols, const nvtop_interface_gpu_opts *gpu_opts,
@@ -22,8 +22,8 @@ diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface
                                 struct window_position *process_position, struct window_position *setup_position,
 diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 --- a/include/nvtop/model_meter_c.h	1970-01-01 02:00:00.000000000 +0200
-+++ b/include/nvtop/model_meter_c.h	2026-10-07 16:40:36.992845533 +0300
-@@ -0,0 +1,99 @@
++++ b/include/nvtop/model_meter_c.h	2026-10-07 22:33:17.838933005 +0300
+@@ -0,0 +1,115 @@
 +/*
 + *
 + * Copyright (C) 2025 DSH User
@@ -77,6 +77,7 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +  uint64_t model_size_bytes;       /* meta.size */
 +  uint64_t n_params;               /* meta.n_params */
 +  char ftype[NVTOP_LLM_FTYPE_MAX]; /* meta.ftype */
++  char model_arg[NVTOP_LLM_MODEL_NAME_MAX]; /* status.args --model, e.g. "./X.gguf" */
 +
 +  /* Live context load, best effort (/metrics?model=...). The router returns
 +   * HTTP 500 when the child instance is not reachable, in which case
@@ -85,6 +86,21 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +  unsigned kv_usage_pct;
 +  uint64_t kv_tokens;
 +  uint64_t kv_tokens_total;
++
++  /* Cold-load progress, read from /proc: the per-model llama-server child's
++   * read_bytes against the size of the GGUF it was told to load. That is only a
++   * valid signal because models.ini sets `load-mode = dio` -- DirectIO sends
++   * every byte through the block layer, so read_bytes advances with the load.
++   * Under mmap loading the counter stalls, which is reported as stalled rather
++   * than as a frozen percentage. Note read_bytes also counts the process's
++   * other reads, so it can pass the file size and the percentage is clamped. */
++  bool has_load_progress;
++  bool load_stalled;
++  unsigned load_pct;
++  uint64_t load_read_bytes;
++  uint64_t load_total_bytes;
++  double load_bytes_per_s; /* 0 until two samples exist */
++  double load_eta_s;       /* 0 when unknown */
 +} nvtop_llm_model;
 +
 +/* One llama.cpp router server, mapped to one GPU */
@@ -124,8 +140,8 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +
 +#endif /* NVTOP_MODEL_METER_C_H__ */
 diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
---- a/src/CMakeLists.txt	2026-10-07 16:40:36.979782933 +0300
-+++ b/src/CMakeLists.txt	2026-10-07 16:40:36.994264759 +0300
+--- a/src/CMakeLists.txt	2026-10-07 22:33:17.819855195 +0300
++++ b/src/CMakeLists.txt	2026-10-07 22:33:17.846119946 +0300
 @@ -17,6 +17,7 @@
    time.c
    plot.c
@@ -148,8 +164,8 @@ diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
    PRIVATE ncurses m ${CMAKE_DL_LIBS})
  
 diff -ruN a/src/interface.c b/src/interface.c
---- a/src/interface.c	2026-10-07 16:40:36.979782933 +0300
-+++ b/src/interface.c	2026-10-07 16:40:36.994264759 +0300
+--- a/src/interface.c	2026-10-07 22:33:17.826609370 +0300
++++ b/src/interface.c	2026-10-07 22:33:17.849942702 +0300
 @@ -28,6 +28,7 @@
  #include "nvtop/interface_options.h"
  #include "nvtop/interface_ring_buffer.h"
@@ -292,7 +308,7 @@ diff -ruN a/src/interface.c b/src/interface.c
    }
  
    alloc_process_with_option(dwin, process_position.posX, process_position.posY, process_position.sizeX,
-@@ -962,6 +1038,203 @@
+@@ -962,6 +1038,254 @@
    return NULL;
  }
  
@@ -394,6 +410,46 @@ diff -ruN a/src/interface.c b/src/interface.c
 +  mvwprintw(win, row, label + 2 + bar, "%.*s", cols - (label + 2 + bar) - 1, tail);
 +}
 +
++/* Cold-load progress bar. Not the context bar: this counts bytes of the GGUF
++ * the child has actually read, so it is only shown while a load is in flight
++ * and only when the counter is genuinely moving. */
++static void llm_draw_load_bar(WINDOW *win, int row, int cols, const nvtop_llm_model *m) {
++  char tail[192];
++  int label = 4, bar, filled;
++
++  if (m->load_stalled) {
++    snprintf(tail, sizeof(tail), " no read progress (load-mode not dio?)");
++  } else {
++    /* read_bytes counts the process's other reads too, so it can pass the file
++     * size: never show more read than there is to read. */
++    uint64_t shown = m->load_read_bytes < m->load_total_bytes ? m->load_read_bytes : m->load_total_bytes;
++    snprintf(tail, sizeof(tail), " %u%%  %.1f/%.1f GiB", m->load_pct,
++             (double)shown / 1073741824.0, (double)m->load_total_bytes / 1073741824.0);
++    if (m->load_bytes_per_s > 0)
++      llm_append(tail, sizeof(tail), "  %.0f MB/s", m->load_bytes_per_s / 1e6);
++    if (m->load_eta_s > 0)
++      llm_append(tail, sizeof(tail), "  eta %.0fs", m->load_eta_s);
++  }
++
++  bar = cols - label - 3 - (int)strlen(tail);
++  if (bar < 1)
++    bar = 1;
++  filled = (int)((double)bar * (double)m->load_pct / 100.0);
++  if (filled > bar)
++    filled = bar;
++
++  wcolor_set(win, cyan_color, NULL);
++  mvwprintw(win, row, 0, "LOAD");
++  wstandend(win);
++  mvwaddch(win, row, label, '[');
++  if (filled > 0)
++    whline(win, '|', filled);
++  if (bar - filled > 0)
++    mvwhline(win, row, label + 1 + filled, ' ', bar - filled);
++  mvwaddch(win, row, label + 1 + bar, ']');
++  mvwprintw(win, row, label + 2 + bar, "%.*s", cols - (label + 2 + bar) - 1, tail);
++}
++
 +/*
 + * One line per model the router is running, e.g. on the GT 1030:
 + *   LLM llamb  granite-docling-258M-Q8_0     ctx 8k   258M
@@ -450,7 +506,14 @@ diff -ruN a/src/interface.c b/src/interface.c
 +    llm_append(line, sizeof(line), "  %s", m->model_name);
 +    mvwprintw(win, 0, 3, "%.*s", cols - 4, line);
 +
-+    if (m->has_live_ctx) {
++    if (m->state == NVTOP_LLM_LOADING) {
++      /* meta{} is absent until the load finishes, so the facts line has nothing
++       * to say here -- show how far the load has got instead. */
++      if (m->has_load_progress || m->load_stalled)
++        llm_draw_load_bar(win, 1, cols, m);
++      else
++        mvwprintw(win, 1, 0, "%.*s", cols - 1, "reading weights, no progress signal yet");
++    } else if (m->has_live_ctx) {
 +      llm_draw_ctx_bar(win, 1, cols, m);
 +    } else {
 +      llm_model_facts(m, facts, sizeof(facts), true);
@@ -475,6 +538,10 @@ diff -ruN a/src/interface.c b/src/interface.c
 +    llm_append(line, sizeof(line), "  %s", m->model_name);
 +    if (facts[0])
 +      llm_append(line, sizeof(line), "  %s", facts);
++    if (m->state == NVTOP_LLM_LOADING && m->has_load_progress)
++      llm_append(line, sizeof(line), "  load %u%%", m->load_pct);
++    else if (m->state == NVTOP_LLM_LOADING && m->load_stalled)
++      llm_append(line, sizeof(line), "  load stalled");
 +    if (m->has_live_ctx)
 +      llm_append(line, sizeof(line), "  kv %u%%", m->kv_usage_pct);
 +    /* Never let a running model vanish silently when there are more of them
@@ -496,7 +563,7 @@ diff -ruN a/src/interface.c b/src/interface.c
  static void draw_devices(struct list_head *devices, struct nvtop_interface *interface) {
    struct gpu_info *device;
    unsigned dev_id = 0;
-@@ -1305,6 +1578,17 @@
+@@ -1305,6 +1629,17 @@
        wnoutrefresh(dev->extra_info[extra_slot]);
      }
  
@@ -514,7 +581,7 @@ diff -ruN a/src/interface.c b/src/interface.c
      dev_id++;
    }
  }
-@@ -2300,6 +2584,9 @@
+@@ -2300,6 +2635,9 @@
  
  void draw_gpu_info_ncurses(unsigned devices_count, struct list_head *devices, struct nvtop_interface *interface) {
  
@@ -525,8 +592,8 @@ diff -ruN a/src/interface.c b/src/interface.c
    draw_devices(devices, interface);
    if (!interface->setup_win.visible) {
 diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
---- a/src/interface_layout_selection.c	2026-10-07 16:40:36.979782933 +0300
-+++ b/src/interface_layout_selection.c	2026-10-07 16:40:36.994264759 +0300
+--- a/src/interface_layout_selection.c	2026-10-07 22:33:17.826609370 +0300
++++ b/src/interface_layout_selection.c	2026-10-07 22:33:17.849942702 +0300
 @@ -232,7 +232,8 @@
  }
  void compute_sizes_from_layout(unsigned devices_count, unsigned device_header_rows, unsigned device_header_cols,
@@ -586,8 +653,8 @@ diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
        headerPosX += device_header_cols + space_between_header_col;
 diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 --- a/src/llm_poller.c	1970-01-01 02:00:00.000000000 +0200
-+++ b/src/llm_poller.c	2026-10-07 16:40:36.994264759 +0300
-@@ -0,0 +1,665 @@
++++ b/src/llm_poller.c	2026-10-07 22:33:17.849942702 +0300
+@@ -0,0 +1,860 @@
 +/*
 + *
 + * Copyright (C) 2025 DSH User
@@ -611,7 +678,11 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +#include "nvtop/model_meter_c.h"
 +
 +#include <ctype.h>
++#include <dirent.h>
++#include <limits.h>
 +#include <stdio.h>
++#include <sys/stat.h>
++#include <unistd.h>
 +#include <stdlib.h>
 +#include <string.h>
 +#include <time.h>
@@ -948,6 +1019,7 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +                dst->parallel = (unsigned)strtoul(tmp, NULL, 10);
 +              args_lookup(args, aend, "--cache-type-k", dst->kv_type_k, sizeof(dst->kv_type_k));
 +              args_lookup(args, aend, "--cache-type-v", dst->kv_type_v, sizeof(dst->kv_type_v));
++              args_lookup(args, aend, "--model", dst->model_arg, sizeof(dst->model_arg));
 +            }
 +          }
 +        }
@@ -1116,6 +1188,190 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +/* Public API                                                          */
 +/* ------------------------------------------------------------------ */
 +
++/* ------------------------------------------------------------------ */
++/* Cold-load progress, from /proc                                      */
++/* ------------------------------------------------------------------ */
++
++/* The per-model llama-server child is the one carrying --model; the router is
++ * also called llama-server but carries --models-dir instead. */
++static bool cmdline_arg(const char *cmd, size_t len, const char *flag, char *out, size_t cap) {
++  size_t i = 0;
++  while (i < len) {
++    const char *arg = cmd + i;
++    size_t alen = strnlen(arg, len - i);
++    if (alen == 0)
++      break;
++    if (strcmp(arg, flag) == 0 && i + alen + 1 < len) {
++      const char *val = cmd + i + alen + 1;
++      size_t vlen = strnlen(val, len - (i + alen + 1));
++      if (vlen == 0 || vlen >= cap)
++        return false;
++      memcpy(out, val, vlen);
++      out[vlen] = '\0';
++      return true;
++    }
++    i += alen + 1;
++  }
++  return false;
++}
++
++/* read_bytes is the only counter that tracks a cold load (see load-mode = dio). */
++static long read_proc_read_bytes(long pid) {
++  char path[64], buf[512];
++  long v = -1;
++  FILE *f;
++
++  snprintf(path, sizeof(path), "/proc/%ld/io", pid);
++  f = fopen(path, "r");
++  if (!f)
++    return -1;
++  while (fgets(buf, sizeof(buf), f)) {
++    if (strncmp(buf, "read_bytes:", 11) == 0) {
++      v = strtol(buf + 11, NULL, 10);
++      break;
++    }
++  }
++  fclose(f);
++  return v;
++}
++
++#define LLM_LOAD_SAMPLES (NVTOP_LLM_MAX_SERVERS * NVTOP_LLM_MAX_LOADED)
++
++/* Previous sample per model, so a rate and an ETA can be derived. */
++static struct {
++  char model[NVTOP_LLM_MODEL_NAME_MAX];
++  uint64_t read_bytes;
++  struct timespec at;
++} g_load_prev[LLM_LOAD_SAMPLES];
++
++static void poll_load_progress(nvtop_llm_model *m) {
++  const char *want_base;
++  DIR *d;
++  struct dirent *e;
++
++  m->has_load_progress = false;
++  m->load_stalled = false;
++  m->load_bytes_per_s = 0.0;
++  m->load_eta_s = 0.0;
++  if (!m->model_arg[0])
++    return;
++  want_base = strrchr(m->model_arg, '/');
++  want_base = want_base ? want_base + 1 : m->model_arg;
++
++  d = opendir("/proc");
++  if (!d)
++    return;
++  while ((e = readdir(d)) != NULL) {
++    char path[64], comm[32], cmd[4096], arg[NVTOP_LLM_MODEL_NAME_MAX], full[PATH_MAX];
++    const char *base;
++    long pid, read_bytes;
++    struct stat st;
++    FILE *f;
++    size_t n;
++
++    if (!isdigit((unsigned char)e->d_name[0]))
++      continue;
++    pid = strtol(e->d_name, NULL, 10);
++    if (pid <= 0)
++      continue;
++
++    snprintf(path, sizeof(path), "/proc/%ld/comm", pid);
++    f = fopen(path, "r");
++    if (!f)
++      continue;
++    if (!fgets(comm, sizeof(comm), f)) {
++      fclose(f);
++      continue;
++    }
++    fclose(f);
++    if (strncmp(comm, "llama-server", 12) != 0)
++      continue;
++
++    snprintf(path, sizeof(path), "/proc/%ld/cmdline", pid);
++    f = fopen(path, "rb");
++    if (!f)
++      continue;
++    n = fread(cmd, 1, sizeof(cmd) - 1, f);
++    fclose(f);
++    cmd[n] = '\0';
++    if (!cmdline_arg(cmd, n, "--model", arg, sizeof(arg)))
++      continue; /* the router */
++
++    base = strrchr(arg, '/');
++    base = base ? base + 1 : arg;
++    if (strcmp(base, want_base) != 0)
++      continue;
++
++    /* The child's --model is relative (the router runs it with the models dir
++     * as cwd), so resolve it through /proc/<pid>/cwd. */
++    if (arg[0] == '/') {
++      snprintf(full, sizeof(full), "%s", arg);
++    } else {
++      char cwd[PATH_MAX], link[64];
++      ssize_t cl;
++      snprintf(link, sizeof(link), "/proc/%ld/cwd", pid);
++      cl = readlink(link, cwd, sizeof(cwd) - 1);
++      if (cl <= 0)
++        continue;
++      cwd[cl] = '\0';
++      snprintf(full, sizeof(full), "%s/%s", cwd, arg);
++    }
++    if (stat(full, &st) != 0 || st.st_size <= 0)
++      continue;
++    read_bytes = read_proc_read_bytes(pid);
++    if (read_bytes < 0)
++      continue;
++
++    m->load_read_bytes = (uint64_t)read_bytes;
++    m->load_total_bytes = (uint64_t)st.st_size;
++    {
++      double pct = 100.0 * (double)read_bytes / (double)st.st_size;
++      if (pct > 100.0)
++        pct = 100.0; /* read_bytes counts other reads too */
++      m->load_pct = (unsigned)(pct + 0.5);
++    }
++    m->has_load_progress = true;
++
++    /* Rate and ETA, plus a genuine "the counter is not moving" verdict: under
++     * mmap loading read_bytes stalls, and a frozen bar would be a lie. */
++    {
++      unsigned slot = 0, free_slot = LLM_LOAD_SAMPLES;
++      struct timespec now;
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      for (unsigned i = 0; i < LLM_LOAD_SAMPLES; i++) {
++        if (strcmp(g_load_prev[i].model, m->model_name) == 0) {
++          slot = i;
++          free_slot = i;
++          break;
++        }
++        if (free_slot == LLM_LOAD_SAMPLES && !g_load_prev[i].model[0])
++          free_slot = i;
++      }
++      if (g_load_prev[slot].model[0]) {
++        double dt = (double)(now.tv_sec - g_load_prev[slot].at.tv_sec) +
++                    (double)(now.tv_nsec - g_load_prev[slot].at.tv_nsec) / 1e9;
++        if (dt > 0.2) {
++          if ((uint64_t)read_bytes > g_load_prev[slot].read_bytes) {
++            m->load_bytes_per_s = (double)((uint64_t)read_bytes - g_load_prev[slot].read_bytes) / dt;
++            if (m->load_bytes_per_s > 0)
++              m->load_eta_s = (double)((uint64_t)st.st_size - (uint64_t)read_bytes) / m->load_bytes_per_s;
++          } else {
++            m->load_stalled = true;
++            m->has_load_progress = false;
++          }
++        }
++      }
++      if (free_slot < LLM_LOAD_SAMPLES) {
++        snprintf(g_load_prev[free_slot].model, sizeof(g_load_prev[free_slot].model), "%s", m->model_name);
++        g_load_prev[free_slot].read_bytes = (uint64_t)read_bytes;
++        g_load_prev[free_slot].at = now;
++      }
++    }
++    break;
++  }
++  closedir(d);
++}
++
 +static bool min_interval_elapsed(void) {
 +  struct timespec now;
 +  long ms;
@@ -1162,6 +1418,12 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +
 +    if (info->loaded_count == 0)
 +      continue;
++
++    /* How far a cold load has got, for anything still loading. Kept ahead of
++     * the metrics backoff so progress still works when /metrics is refused. */
++    for (unsigned k = 0; k < info->loaded_count; k++)
++      if (info->models[k].state == NVTOP_LLM_LOADING)
++        poll_load_progress(&info->models[k]);
 +
 +    /* Live KV load for each running model. If the router cannot serve it, back
 +     * off rather than hammering its log with refused requests. */
@@ -1254,8 +1516,8 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +  g_ready = false;
 +}
 diff -ruN a/src/nvtop.c b/src/nvtop.c
---- a/src/nvtop.c	2026-10-07 16:40:36.980718474 +0300
-+++ b/src/nvtop.c	2026-10-07 16:40:36.994264759 +0300
+--- a/src/nvtop.c	2026-10-07 22:33:17.826609370 +0300
++++ b/src/nvtop.c	2026-10-07 22:33:17.849942702 +0300
 @@ -24,6 +24,7 @@
  #include "nvtop/interface.h"
  #include "nvtop/interface_common.h"
