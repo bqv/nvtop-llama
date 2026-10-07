@@ -1,0 +1,1195 @@
+diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_internal_common.h
+--- a/include/nvtop/interface_internal_common.h	2026-10-07 15:12:23.278663665 +0300
++++ b/include/nvtop/interface_internal_common.h	2026-10-07 15:12:23.320073823 +0300
+@@ -69,6 +69,7 @@
+   WINDOW *shader_cores;
+   WINDOW *l2_cache_size;
+   WINDOW *exec_engines;
++  WINDOW *llm_meter_win; // LLM model meter display
+   bool enc_was_visible;
+   bool dec_was_visible;
+   nvtop_time last_decode_seen;
+diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
+--- a/include/nvtop/model_meter_c.h	1970-01-01 02:00:00.000000000 +0200
++++ b/include/nvtop/model_meter_c.h	2026-10-07 15:12:23.320073823 +0300
+@@ -0,0 +1,95 @@
++/*
++ *
++ * Copyright (C) 2025 DSH User
++ *
++ * Nvtop Model Meter C API - LLM model info from llama.cpp router servers
++ *
++ * Nvtop is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ */
++
++#ifndef NVTOP_MODEL_METER_C_H__
++#define NVTOP_MODEL_METER_C_H__
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define NVTOP_LLM_MAX_SERVERS 4
++#define NVTOP_LLM_SERVER_NAME_MAX 24
++#define NVTOP_LLM_GPU_HINT_MAX 32
++#define NVTOP_LLM_MODEL_NAME_MAX 192
++#define NVTOP_LLM_FTYPE_MAX 32
++#define NVTOP_LLM_KVTYPE_MAX 12
++
++/* A router can serve several models at once (llama.cpp `max_instances`), so
++ * one server holds a list of them. */
++#define NVTOP_LLM_MAX_LOADED 4
++
++/* State of one model on a router */
++typedef enum {
++  NVTOP_LLM_SERVER_DOWN = 0, /* nothing answered on the socket */
++  NVTOP_LLM_IDLE,            /* router answered, this model is not running */
++  NVTOP_LLM_LOADING,
++  NVTOP_LLM_LOADED,
++} nvtop_llm_state;
++
++/* One model instance on a router */
++typedef struct nvtop_llm_model {
++  char model_name[NVTOP_LLM_MODEL_NAME_MAX];
++  nvtop_llm_state state;
++
++  /* Static facts, from meta{} (falls back to status.args) */
++  unsigned ctx_size;  /* meta.n_ctx / --ctx-size */
++  unsigned ctx_train; /* meta.n_ctx_train */
++  unsigned parallel;  /* --parallel */
++  char kv_type_k[NVTOP_LLM_KVTYPE_MAX];
++  char kv_type_v[NVTOP_LLM_KVTYPE_MAX];
++  uint64_t model_size_bytes;       /* meta.size */
++  uint64_t n_params;               /* meta.n_params */
++  char ftype[NVTOP_LLM_FTYPE_MAX]; /* meta.ftype */
++
++  /* Live context load, best effort (/metrics?model=...). The router returns
++   * HTTP 500 when the child instance is not reachable, in which case
++   * has_live_ctx stays false and the UI shows the static facts instead. */
++  bool has_live_ctx;
++  unsigned kv_usage_pct;
++  uint64_t kv_tokens;
++  uint64_t kv_tokens_total;
++} nvtop_llm_model;
++
++/* One llama.cpp router server, mapped to one GPU */
++typedef struct nvtop_model_meter_info {
++  char server_name[NVTOP_LLM_SERVER_NAME_MAX]; /* "llama" */
++  char gpu_hint[NVTOP_LLM_GPU_HINT_MAX];       /* substring matched in the GPU name */
++  bool reachable;
++
++  /* Aggregate over models[]: LOADED if any is loaded, LOADING if any is
++   * loading, IDLE if the router answered with nothing running. */
++  nvtop_llm_state state;
++
++  unsigned preset_count; /* how many models the router advertises */
++  unsigned loaded_count; /* valid entries in models[] */
++  nvtop_llm_model models[NVTOP_LLM_MAX_LOADED];
++} nvtop_model_meter_info;
++
++/* Poll every configured server. Cheap no-op when called more often than the
++ * internal minimum interval. Returns true if at least one server answered. */
++bool nvtop_model_meter_poll(void);
++
++/* Number of servers that have been polled */
++unsigned nvtop_model_meter_count(void);
++
++/* Info for server idx, or NULL when out of range */
++const nvtop_model_meter_info *nvtop_model_meter_get(unsigned idx);
++
++/* Best match for a GPU device name (e.g. "AMD Radeon RX 7900 XT" -> llama),
++ * or NULL when no configured server maps to that GPU. */
++const nvtop_model_meter_info *nvtop_model_meter_for_gpu(const char *gpu_name);
++
++void nvtop_model_meter_shutdown(void);
++
++#endif /* NVTOP_MODEL_METER_C_H__ */
+diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt	2026-10-07 15:12:23.293360659 +0300
++++ b/src/CMakeLists.txt	2026-10-07 15:12:23.320995027 +0300
+@@ -16,6 +16,7 @@
+   time.c
+   plot.c
+   ini.c
++  llm_poller.c
+ )
+ 
+ check_c_source_compiles(
+@@ -157,6 +158,12 @@
+ 
+ target_compile_definitions(nvtop PRIVATE _GNU_SOURCE)
+ 
++find_package(CURL)
++if(CURL_FOUND)
++  target_link_libraries(nvtop PRIVATE ${CURL_LIBRARIES})
++  target_include_directories(nvtop PRIVATE ${CURL_INCLUDE_DIRS})
++endif()
++
+ target_link_libraries(nvtop
+   PRIVATE ncurses m ${CMAKE_DL_LIBS})
+ 
+diff -ruN a/src/interface.c b/src/interface.c
+--- a/src/interface.c	2026-10-07 15:12:23.294245878 +0300
++++ b/src/interface.c	2026-10-07 15:12:23.327579209 +0300
+@@ -28,6 +28,7 @@
+ #include "nvtop/interface_options.h"
+ #include "nvtop/interface_ring_buffer.h"
+ #include "nvtop/interface_setup_win.h"
++#include "nvtop/model_meter_c.h"
+ #include "nvtop/plot.h"
+ #include "nvtop/time.h"
+ 
+@@ -35,6 +36,7 @@
+ #include <inttypes.h>
+ #include <ncurses.h>
+ #include <signal.h>
++#include <stdarg.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -56,7 +58,7 @@
+ };
+ 
+ static void alloc_device_window(unsigned int start_row, unsigned int start_col, unsigned int totalcol,
+-                                struct device_window *dwin) {
++                                unsigned int base_rows, unsigned int llm_rows, struct device_window *dwin) {
+ 
+   const unsigned int spacer = 1;
+ 
+@@ -176,6 +178,19 @@
+   if (dwin->exec_engines == NULL)
+     goto alloc_error;
+ 
++  // LLM model meter gets its own window below the GPU lines. It must NOT be a
++  // subwindow: every line above is exactly one row tall, so a subwindow taller
++  // than its parent spills over the plots. The layout reserves llm_rows for it.
++  dwin->llm_meter_win = NULL;
++  if (llm_rows > 0 && totalcol > 24) {
++    unsigned int meter_row = start_row + base_rows;
++    int term_rows, term_cols;
++    getmaxyx(stdscr, term_rows, term_cols);
++    (void)term_cols;
++    if ((int)(meter_row + llm_rows) <= term_rows)
++      dwin->llm_meter_win = newwin(llm_rows, totalcol, meter_row, start_col);
++  }
++
+   return;
+ alloc_error:
+   endwin();
+@@ -200,6 +215,8 @@
+   delwin(dwin->temperature);
+   delwin(dwin->fan_speed);
+   delwin(dwin->pcie_info);
++  if (dwin->llm_meter_win)
++    delwin(dwin->llm_meter_win);
+ }
+ 
+ static void alloc_process_with_option(struct nvtop_interface *interface, unsigned posX, unsigned posY, unsigned sizeX,
+@@ -348,6 +365,35 @@
+ 
+ static pid_t nvtop_pid;
+ 
++/* One layout pass. Called a few times at startup to pick how much room the LLM
++ * meter may take without costing the plots anything. */
++static void compute_layout_for_interface(struct nvtop_interface *dwin, unsigned devices_count, unsigned header_rows,
++                                         unsigned rows, unsigned cols, struct window_position *device_positions,
++                                         struct window_position plot_positions[MAX_CHARTS],
++                                         unsigned *map_device_to_plot, struct window_position *process_position,
++                                         struct window_position *setup_position) {
++  compute_sizes_from_layout(devices_count, header_rows, device_length(), rows - 1, cols, dwin->options.gpu_specific_opts,
++                            dwin->options.process_fields_displayed, device_positions, &dwin->num_plots, plot_positions,
++                            map_device_to_plot, process_position, setup_position, dwin->options.hide_processes_list);
++}
++
++/* Real vertical extent of the plot area. Plots that share a stack all report
++ * the same posY/sizeY, so this must be measured over the area, not summed per
++ * plot, or side-by-side charts get counted twice. */
++static unsigned plot_area_rows(const struct window_position *plot_positions, unsigned num_plots) {
++  unsigned top = 0, bottom = 0;
++  bool first = true;
++
++  for (unsigned p = 0; p < num_plots; p++) {
++    if (first || plot_positions[p].posY < top)
++      top = plot_positions[p].posY;
++    if (first || plot_positions[p].posY + plot_positions[p].sizeY > bottom)
++      bottom = plot_positions[p].posY + plot_positions[p].sizeY;
++    first = false;
++  }
++  return num_plots ? bottom - top : 0;
++}
++
+ static void initialize_all_windows(struct nvtop_interface *dwin) {
+   int rows, cols;
+   getmaxyx(stdscr, rows, cols);
+@@ -360,16 +406,34 @@
+   struct window_position plot_positions[MAX_CHARTS];
+   struct window_position setup_position;
+ 
+-  compute_sizes_from_layout(devices_count, dwin->options.has_gpu_info_bar ? 4 : 3, device_length(), rows - 1, cols,
+-                            dwin->options.gpu_specific_opts, dwin->options.process_fields_displayed, device_positions,
+-                            &dwin->num_plots, plot_positions, map_device_to_plot, &process_position, &setup_position,
+-                            dwin->options.hide_processes_list);
++  // Rows each GPU block really needs: 3 lines, plus a 4th for the info bar.
++  unsigned int base_header_rows = dwin->options.has_gpu_info_bar ? 4 : 3;
++  unsigned int llm_rows_pref = rows >= 30 ? 2u : (rows >= 22 ? 1u : 0u);
++  unsigned int llm_rows = 0;
++  unsigned int baseline_plots;
++
++  compute_layout_for_interface(dwin, devices_count, base_header_rows, rows, cols, device_positions, plot_positions,
++                               map_device_to_plot, &process_position, &setup_position);
++  baseline_plots = dwin->num_plots;
++
++  /* Reserve rows for the LLM model meter, but only as many as the plots can
++   * spare: take the tallest meter that keeps every chart and leaves a usable
++   * plot area, falling back a row at a time and finally to no meter at all
++   * rather than losing the graphs. */
++  for (unsigned int candidate = llm_rows_pref;; candidate--) {
++    compute_layout_for_interface(dwin, devices_count, base_header_rows + candidate, rows, cols, device_positions,
++                                 plot_positions, map_device_to_plot, &process_position, &setup_position);
++    if (candidate == 0 || (dwin->num_plots >= baseline_plots && plot_area_rows(plot_positions, dwin->num_plots) >= 7)) {
++      llm_rows = candidate;
++      break;
++    }
++  }
+ 
+   alloc_plot_window(devices_count, plot_positions, map_device_to_plot, dwin);
+ 
+   for (unsigned int i = 0; i < devices_count; ++i) {
+-    alloc_device_window(device_positions[i].posY, device_positions[i].posX, device_positions[i].sizeX,
+-                        &dwin->devices_win[i]);
++    alloc_device_window(device_positions[i].posY, device_positions[i].posX, device_positions[i].sizeX, base_header_rows,
++                        llm_rows, &dwin->devices_win[i]);
+   }
+ 
+   alloc_process_with_option(dwin, process_position.posX, process_position.posY, process_position.sizeX,
+@@ -621,6 +685,203 @@
+   }
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* LLM model meter                                                     */
++/* ------------------------------------------------------------------ */
++
++static void llm_append(char *buf, size_t cap, const char *fmt, ...) {
++  size_t len = strlen(buf);
++  va_list ap;
++
++  if (len + 1 >= cap)
++    return;
++  va_start(ap, fmt);
++  vsnprintf(buf + len, cap - len, fmt, ap);
++  va_end(ap);
++}
++
++static void llm_fmt_count(char *out, size_t cap, uint64_t v) {
++  if (v >= 1000000000ull)
++    snprintf(out, cap, "%.1fB", (double)v / 1000000000.0);
++  else if (v >= 1000000ull)
++    snprintf(out, cap, "%.1fM", (double)v / 1000000.0);
++  else if (v >= 1000ull)
++    snprintf(out, cap, "%.1fk", (double)v / 1000.0);
++  else
++    snprintf(out, cap, "%llu", (unsigned long long)v);
++}
++
++static void llm_fmt_bytes(char *out, size_t cap, uint64_t v) {
++  if (v >= 1000000000ull)
++    snprintf(out, cap, "%.1fG", (double)v / 1000000000.0);
++  else if (v >= 1000000ull)
++    snprintf(out, cap, "%.0fM", (double)v / 1000000.0);
++  else
++    snprintf(out, cap, "%.0fK", (double)v / 1000.0);
++}
++
++/* Compact facts for one model. `full` adds the training context, parameter
++ * count, quantisation and KV cache types, which only fit on a dedicated row. */
++static void llm_model_facts(const nvtop_llm_model *m, char *out, size_t cap, bool full) {
++  char tmp[32];
++
++  out[0] = '\0';
++  if (m->ctx_size) {
++    llm_fmt_count(tmp, sizeof(tmp), m->ctx_size);
++    llm_append(out, cap, "ctx %s", tmp);
++  }
++  if (full && m->ctx_train) {
++    llm_fmt_count(tmp, sizeof(tmp), m->ctx_train);
++    llm_append(out, cap, "  train %s", tmp);
++  }
++  if (m->model_size_bytes) {
++    llm_fmt_bytes(tmp, sizeof(tmp), m->model_size_bytes);
++    llm_append(out, cap, "  %s", tmp);
++  }
++  if (full && m->n_params) {
++    llm_fmt_count(tmp, sizeof(tmp), m->n_params);
++    llm_append(out, cap, "  %s", tmp);
++  }
++  if (full && m->parallel > 1) {
++    snprintf(tmp, sizeof(tmp), "%u", m->parallel);
++    llm_append(out, cap, "  slots %s", tmp);
++  }
++  if (full && m->ftype[0])
++    llm_append(out, cap, "  %s", m->ftype);
++  if (full && m->kv_type_k[0] && m->kv_type_v[0])
++    llm_append(out, cap, "  kv %s/%s", m->kv_type_k, m->kv_type_v);
++}
++
++/* Live KV-cache load bar, drawn like the GPU/MEM meters. */
++static void llm_draw_ctx_bar(WINDOW *win, int row, int cols, const nvtop_llm_model *m) {
++  char pct[16], tail[128];
++  int label = 4, bar, filled;
++
++  snprintf(pct, sizeof(pct), "%u%%", m->kv_usage_pct);
++  if (m->kv_tokens_total)
++    snprintf(tail, sizeof(tail), " %s  %llu/%llu", pct, (unsigned long long)m->kv_tokens,
++             (unsigned long long)m->kv_tokens_total);
++  else
++    snprintf(tail, sizeof(tail), " %s", pct);
++
++  bar = cols - label - 3 - (int)strlen(tail);
++  if (bar < 1)
++    bar = 1;
++  filled = (int)((double)bar * (double)m->kv_usage_pct / 100.0);
++  if (filled > bar)
++    filled = bar;
++
++  wcolor_set(win, cyan_color, NULL);
++  mvwprintw(win, row, 0, "CTX");
++  wstandend(win);
++  mvwaddch(win, row, label, '[');
++  if (filled > 0)
++    whline(win, '|', filled);
++  if (bar - filled > 0)
++    mvwhline(win, row, label + 1 + filled, ' ', bar - filled);
++  mvwaddch(win, row, label + 1 + bar, ']');
++  mvwprintw(win, row, label + 2 + bar, "%.*s", cols - (label + 2 + bar) - 1, tail);
++}
++
++/*
++ * One line per model the router is running, e.g. on the GT 1030:
++ *   LLM llamb  granite-docling-258M-Q8_0     ctx 8k   258M
++ *   LLM llamb  Qwen3-Embedding-0.6B-Q8_0     ctx 4k   633M
++ *
++ * With a single model there is room to spare, so the name gets its own line
++ * and the second line shows either the live context bar or the full facts:
++ *   LLM llama  Qwen3.5-35B-A3B-UD-IQ4_XS-240k
++ *   CTX [||||||||        ] 41%  1234/245760
++ */
++static void draw_llm_meter(WINDOW *win, const nvtop_model_meter_info *info) {
++  int rows, cols;
++  char line[512], facts[256];
++
++  getmaxyx(win, rows, cols);
++  werase(win);
++  if (cols <= 8)
++    return;
++
++  /* No router on the socket, or nothing running. */
++  if (info->state == NVTOP_LLM_SERVER_DOWN || info->loaded_count == 0) {
++    wcolor_set(win, cyan_color, NULL);
++    mvwprintw(win, 0, 0, "LLM");
++    wstandend(win);
++    if (info->state == NVTOP_LLM_SERVER_DOWN)
++      snprintf(line, sizeof(line), " %s  router not reachable", info->server_name);
++    else
++      snprintf(line, sizeof(line), " %s  idle, none loaded", info->server_name);
++    mvwprintw(win, 0, 3, "%.*s", cols - 4, line);
++
++    if (rows >= 2) {
++      if (info->state == NVTOP_LLM_SERVER_DOWN)
++        snprintf(line, sizeof(line), "no connection to the router");
++      else
++        snprintf(line, sizeof(line), "%u presets advertised, loaded on demand", info->preset_count);
++      mvwprintw(win, 1, 0, "%.*s", cols - 1, line);
++    }
++    wnoutrefresh(win);
++    return;
++  }
++
++  /* Exactly one model: name on line 0, details on line 1. */
++  if (info->loaded_count == 1 && rows >= 2) {
++    const nvtop_llm_model *m = &info->models[0];
++
++    wcolor_set(win, cyan_color, NULL);
++    mvwprintw(win, 0, 0, "LLM");
++    wstandend(win);
++
++    line[0] = '\0';
++    llm_append(line, sizeof(line), " %s", info->server_name);
++    if (m->state == NVTOP_LLM_LOADING)
++      llm_append(line, sizeof(line), " loading");
++    llm_append(line, sizeof(line), "  %s", m->model_name);
++    mvwprintw(win, 0, 3, "%.*s", cols - 4, line);
++
++    if (m->has_live_ctx) {
++      llm_draw_ctx_bar(win, 1, cols, m);
++    } else {
++      llm_model_facts(m, facts, sizeof(facts), true);
++      mvwprintw(win, 1, 0, "%.*s", cols - 1, facts[0] ? facts : "model loaded");
++    }
++    wnoutrefresh(win);
++    return;
++  }
++
++  /* Several models running at once (llama.cpp `max_instances`): one line each,
++   * facts inline, truncated if they do not all fit. */
++  for (int r = 0; r < rows && (unsigned)r < info->loaded_count; r++) {
++    const nvtop_llm_model *m = &info->models[r];
++    unsigned remaining = info->loaded_count - (unsigned)r - 1;
++
++    llm_model_facts(m, facts, sizeof(facts), false);
++
++    line[0] = '\0';
++    llm_append(line, sizeof(line), " %s", info->server_name);
++    if (m->state == NVTOP_LLM_LOADING)
++      llm_append(line, sizeof(line), " loading");
++    llm_append(line, sizeof(line), "  %s", m->model_name);
++    if (facts[0])
++      llm_append(line, sizeof(line), "  %s", facts);
++    if (m->has_live_ctx)
++      llm_append(line, sizeof(line), "  kv %u%%", m->kv_usage_pct);
++    /* Never let a running model vanish silently when there are more of them
++     * than there are rows to show them on. */
++    if (r == rows - 1 && remaining > 0)
++      llm_append(line, sizeof(line), "  +%u more", remaining);
++
++    if (r == 0) {
++      wcolor_set(win, cyan_color, NULL);
++      mvwprintw(win, r, 0, "LLM");
++      wstandend(win);
++    }
++    mvwprintw(win, r, 3, "%.*s", cols - 4, line);
++  }
++
++  wnoutrefresh(win);
++}
++
+ static void draw_devices(struct list_head *devices, struct nvtop_interface *interface) {
+   struct gpu_info *device;
+   unsigned dev_id = 0;
+@@ -860,6 +1121,25 @@
+       wnoutrefresh(dev->exec_engines);
+     }
+ 
++    /* LLM model meter, on the rows reserved by the layout below this GPU */
++    if (dev->llm_meter_win) {
++      const nvtop_model_meter_info *llm = NULL;
++      if (GPUINFO_STATIC_FIELD_VALID(&device->static_info, device_name))
++        llm = nvtop_model_meter_for_gpu(device->static_info.device_name);
++      if (llm) {
++        draw_llm_meter(dev->llm_meter_win, llm);
++      } else {
++        /* No LLM router is mapped to this GPU (e.g. the iGPU driving the
++         * displays): say so rather than leaving a mysterious blank gap. */
++        werase(dev->llm_meter_win);
++        wcolor_set(dev->llm_meter_win, cyan_color, NULL);
++        mvwprintw(dev->llm_meter_win, 0, 0, "LLM");
++        wstandend(dev->llm_meter_win);
++        mvwprintw(dev->llm_meter_win, 0, 3, " -");
++        wnoutrefresh(dev->llm_meter_win);
++      }
++    }
++
+     dev_id++;
+   }
+ }
+@@ -1797,6 +2077,9 @@
+ 
+ void draw_gpu_info_ncurses(unsigned devices_count, struct list_head *devices, struct nvtop_interface *interface) {
+ 
++  /* Refresh the LLM router state (no-op if polled recently). */
++  nvtop_model_meter_poll();
++
+   draw_devices(devices, interface);
+   if (!interface->setup_win.visible) {
+     draw_plots(interface);
+diff -ruN a/src/llm_poller.c b/src/llm_poller.c
+--- a/src/llm_poller.c	1970-01-01 02:00:00.000000000 +0200
++++ b/src/llm_poller.c	2026-10-07 15:12:23.327579209 +0300
+@@ -0,0 +1,652 @@
++/*
++ *
++ * Copyright (C) 2025 DSH User
++ *
++ * LLM Poller - polls llama.cpp router servers on behalf of the nvtop meter
++ *
++ * Nvtop is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Data sources (llama.cpp router):
++ *   GET /v1/models            -> data[]: id, status.value, status.args, meta{}
++ *   GET /metrics?model=<id>   -> prometheus text, best effort
++ *
++ * A router serves up to `max_instances` models at once, so every loaded model
++ * is collected, not just the first.
++ *
++ */
++
++#include "nvtop/model_meter_c.h"
++
++#include <ctype.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include <curl/curl.h>
++
++/* ------------------------------------------------------------------ */
++/* Server <-> GPU mapping                                              */
++/* ------------------------------------------------------------------ */
++
++struct server_def {
++  char name[NVTOP_LLM_SERVER_NAME_MAX]; /* label shown in the meter */
++  char host[64];                        /* host:port of the router  */
++  char gpu_hint[NVTOP_LLM_GPU_HINT_MAX]; /* substring of the GPU name */
++};
++
++static struct server_def g_defs[NVTOP_LLM_MAX_SERVERS] = {
++    {"llama", "127.0.0.1:55555", "7900"},
++    {"llamb", "127.0.0.1:55556", "1030"},
++};
++static unsigned g_def_count = 2;
++
++/*
++ * Optional override, so the routers can be moved without a rebuild:
++ *   NVTOP_LLM_SERVERS="llama=127.0.0.1:55555=7900;llamb=127.0.0.1:55556=1030"
++ * The third field is a substring matched against the GPU device name to decide
++ * which GPU block the meter belongs to.
++ */
++static void servers_init(void) {
++  static bool done = false;
++  const char *env, *p;
++  unsigned n = 0;
++
++  if (done)
++    return;
++  done = true;
++
++  env = getenv("NVTOP_LLM_SERVERS");
++  if (!env || !*env)
++    return;
++
++  p = env;
++  while (*p && n < NVTOP_LLM_MAX_SERVERS) {
++    char buf[256];
++    size_t len = 0;
++    char *eq1, *eq2, *hint = NULL;
++
++    while (*p && *p != ';' && len < sizeof(buf) - 1)
++      buf[len++] = *p++;
++    buf[len] = '\0';
++    if (*p == ';')
++      p++;
++    if (!buf[0])
++      continue;
++
++    eq1 = strchr(buf, '=');
++    if (!eq1)
++      continue;
++    *eq1 = '\0';
++    eq2 = strchr(eq1 + 1, '=');
++    if (eq2) {
++      *eq2 = '\0';
++      hint = eq2 + 1;
++    }
++
++    snprintf(g_defs[n].name, sizeof(g_defs[n].name), "%s", buf);
++    snprintf(g_defs[n].host, sizeof(g_defs[n].host), "%s", eq1 + 1);
++    snprintf(g_defs[n].gpu_hint, sizeof(g_defs[n].gpu_hint), "%s", hint ? hint : "");
++    n++;
++  }
++  if (n)
++    g_def_count = n;
++}
++
++#define LLM_MODELS_PATH "/v1/models"
++#define LLM_BODY_MAX (512u * 1024u)
++#define LLM_MIN_POLL_MS 1200
++
++/* When a router cannot serve /metrics, do not retry it on every single poll:
++ * each refused request lands in the router log. */
++#define LLM_METRICS_BACKOFF_POLLS 25
++
++/* ------------------------------------------------------------------ */
++/* State                                                               */
++/* ------------------------------------------------------------------ */
++
++static nvtop_model_meter_info g_servers[NVTOP_LLM_MAX_SERVERS];
++static int g_metrics_backoff[NVTOP_LLM_MAX_SERVERS];
++static bool g_ready = false;
++static struct timespec g_last_poll;
++static CURL *g_curl = NULL;
++static bool g_curl_ready = false;
++static char g_body[LLM_BODY_MAX];
++
++/* ------------------------------------------------------------------ */
++/* HTTP                                                                */
++/* ------------------------------------------------------------------ */
++
++struct membuf {
++  char *buf;
++  size_t len;
++  size_t cap;
++};
++
++static size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
++  struct membuf *m = (struct membuf *)userdata;
++  size_t n = size * nmemb;
++  if (n > m->cap - 1 - m->len)
++    n = (m->cap - 1 > m->len) ? (m->cap - 1 - m->len) : 0;
++  if (n) {
++    memcpy(m->buf + m->len, ptr, n);
++    m->len += n;
++    m->buf[m->len] = '\0';
++  }
++  return size * nmemb; /* always consume everything, never abort the transfer */
++}
++
++static bool http_get(const char *host, const char *path, char *out, size_t cap, long *http_code) {
++  char url[512];
++  struct membuf m = {out, 0, cap};
++
++  if (cap)
++    out[0] = '\0';
++  if (!g_curl)
++    return false;
++
++  snprintf(url, sizeof(url), "http://%s%s", host, path);
++
++  curl_easy_setopt(g_curl, CURLOPT_URL, url);
++  curl_easy_setopt(g_curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
++  curl_easy_setopt(g_curl, CURLOPT_WRITEDATA, &m);
++  curl_easy_setopt(g_curl, CURLOPT_NOSIGNAL, 1L);
++  curl_easy_setopt(g_curl, CURLOPT_CONNECTTIMEOUT_MS, 400L);
++  curl_easy_setopt(g_curl, CURLOPT_TIMEOUT_MS, 1200L);
++  curl_easy_setopt(g_curl, CURLOPT_FOLLOWLOCATION, 0L);
++  curl_easy_setopt(g_curl, CURLOPT_USERAGENT, "nvtop-llm-meter");
++
++  if (curl_easy_perform(g_curl) != CURLE_OK)
++    return false;
++
++  if (http_code) {
++    long code = 0;
++    curl_easy_getinfo(g_curl, CURLINFO_RESPONSE_CODE, &code);
++    *http_code = code;
++  }
++  return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* Minimal, bounded JSON helpers                                       */
++/* ------------------------------------------------------------------ */
++
++/* p points at the opening quote; returns the position just past the closing
++ * quote, or the terminating NUL when unterminated. */
++static const char *skip_json_string(const char *p) {
++  p++;
++  while (*p) {
++    if (*p == '\\' && p[1]) {
++      p += 2;
++      continue;
++    }
++    if (*p == '"')
++      return p + 1;
++    p++;
++  }
++  return p;
++}
++
++/* p points at '{' or '['; returns the matching closer, or NULL. */
++static const char *match_pair(const char *p) {
++  char open = *p;
++  char close = (open == '{') ? '}' : ']';
++  int depth = 0;
++
++  while (*p) {
++    if (*p == '"') {
++      p = skip_json_string(p);
++      continue;
++    }
++    if (*p == open)
++      depth++;
++    else if (*p == close) {
++      depth--;
++      if (depth == 0)
++        return p;
++    }
++    p++;
++  }
++  return NULL;
++}
++
++/* Search for "key" within [s,e); returns the position just after the ':'. */
++static const char *key_in(const char *s, const char *e, const char *key) {
++  size_t klen = strlen(key);
++  const char *p = s;
++
++  while (p && p < e) {
++    if (*p == '"') {
++      const char *after = skip_json_string(p);
++      if ((size_t)(after - p) == klen + 2 && strncmp(p + 1, key, klen) == 0) {
++        const char *c = after;
++        while (c < e && isspace((unsigned char)*c))
++          c++;
++        if (c < e && *c == ':')
++          return c + 1;
++        return NULL;
++      }
++      p = after;
++      continue;
++    }
++    p++;
++  }
++  return NULL;
++}
++
++static const char *json_string(const char *p, char *out, size_t cap) {
++  size_t i = 0;
++
++  while (*p && isspace((unsigned char)*p))
++    p++;
++  if (*p != '"') {
++    if (cap)
++      out[0] = '\0';
++    return NULL;
++  }
++  p++;
++  while (*p && *p != '"') {
++    char c = *p;
++    if (c == '\\' && p[1]) {
++      p++;
++      c = *p;
++      if (c == 'n')
++        c = '\n';
++      else if (c == 't')
++        c = '\t';
++      else if (c == 'r')
++        c = '\r';
++    }
++    if (i + 1 < cap)
++      out[i++] = c;
++    p++;
++  }
++  if (cap)
++    out[i] = '\0';
++  return (*p == '"') ? p + 1 : p;
++}
++
++/* Accepts both bare numbers and numbers quoted as strings. */
++static bool json_u64(const char *p, uint64_t *out) {
++  while (*p && isspace((unsigned char)*p))
++    p++;
++  if (*p == '"')
++    p++;
++  if (!isdigit((unsigned char)*p))
++    return false;
++  uint64_t v = 0;
++  while (isdigit((unsigned char)*p)) {
++    v = v * 10 + (uint64_t)(*p - '0');
++    p++;
++  }
++  *out = v;
++  return true;
++}
++
++/* Look up the value following `flag` inside a JSON string array. */
++static bool args_lookup(const char *arr, const char *arr_end, const char *flag, char *out, size_t cap) {
++  char cur[256];
++  const char *p = arr;
++
++  if (p >= arr_end || *p != '[')
++    return false;
++  p++;
++  while (p < arr_end) {
++    while (p < arr_end && *p != '"')
++      p++;
++    if (p >= arr_end)
++      break;
++    const char *after = json_string(p, cur, sizeof(cur));
++    if (!after || after > arr_end)
++      break;
++    if (strcmp(cur, flag) == 0) {
++      const char *q = after;
++      while (q < arr_end && *q != '"')
++        q++;
++      if (q < arr_end) {
++        json_string(q, out, cap);
++        return true;
++      }
++      return false;
++    }
++    p = after;
++  }
++  return false;
++}
++
++/* ------------------------------------------------------------------ */
++/* /v1/models                                                          */
++/* ------------------------------------------------------------------ */
++
++static void model_object_parse(const char *obj, const char *obj_end, nvtop_llm_model *dst) {
++  const char *v;
++
++  if ((v = key_in(obj, obj_end, "id")))
++    json_string(v, dst->model_name, sizeof(dst->model_name));
++
++  if ((v = key_in(obj, obj_end, "status"))) {
++    while (v < obj_end && isspace((unsigned char)*v))
++      v++;
++    if (v < obj_end && *v == '{') {
++      const char *send = match_pair(v);
++      if (send && send <= obj_end) {
++        const char *val = key_in(v, send, "value");
++        if (val) {
++          char s[32] = "";
++          json_string(val, s, sizeof(s));
++          if (strcmp(s, "loaded") == 0)
++            dst->state = NVTOP_LLM_LOADED;
++          else if (strcmp(s, "loading") == 0)
++            dst->state = NVTOP_LLM_LOADING;
++          else
++            dst->state = NVTOP_LLM_IDLE;
++        }
++        const char *args = key_in(v, send, "args");
++        if (args) {
++          while (args < send && isspace((unsigned char)*args))
++            args++;
++          if (args < send && *args == '[') {
++            const char *aend = match_pair(args);
++            if (aend && aend <= send) {
++              char tmp[64];
++              if (args_lookup(args, aend, "--ctx-size", tmp, sizeof(tmp)))
++                dst->ctx_size = (unsigned)strtoul(tmp, NULL, 10);
++              if (args_lookup(args, aend, "--parallel", tmp, sizeof(tmp)))
++                dst->parallel = (unsigned)strtoul(tmp, NULL, 10);
++              args_lookup(args, aend, "--cache-type-k", dst->kv_type_k, sizeof(dst->kv_type_k));
++              args_lookup(args, aend, "--cache-type-v", dst->kv_type_v, sizeof(dst->kv_type_v));
++            }
++          }
++        }
++      }
++    }
++  }
++
++  if ((v = key_in(obj, obj_end, "meta"))) {
++    while (v < obj_end && isspace((unsigned char)*v))
++      v++;
++    if (v < obj_end && *v == '{') {
++      const char *mend = match_pair(v);
++      if (mend && mend <= obj_end) {
++        const char *k;
++        uint64_t n = 0;
++        if ((k = key_in(v, mend, "n_ctx")) && json_u64(k, &n))
++          dst->ctx_size = (unsigned)n;
++        if ((k = key_in(v, mend, "n_ctx_train")) && json_u64(k, &n))
++          dst->ctx_train = (unsigned)n;
++        if ((k = key_in(v, mend, "n_params")) && json_u64(k, &n))
++          dst->n_params = n;
++        if ((k = key_in(v, mend, "size")) && json_u64(k, &n))
++          dst->model_size_bytes = n;
++        if ((k = key_in(v, mend, "ftype")))
++          json_string(k, dst->ftype, sizeof(dst->ftype));
++      }
++    }
++  }
++}
++
++/* Collect every model the router is actually running. */
++static void parse_models_list(const char *json, nvtop_model_meter_info *info) {
++  const char *data = key_in(json, json + strlen(json), "data");
++  const char *p, *arr_end, *it;
++  unsigned count = 0, loading = 0;
++
++  if (!data)
++    return;
++  p = data;
++  while (*p && isspace((unsigned char)*p))
++    p++;
++  if (*p != '[')
++    return;
++  arr_end = match_pair(p);
++  if (!arr_end)
++    return;
++
++  it = p + 1;
++  while (it < arr_end) {
++    const char *oend;
++    nvtop_llm_model tmp;
++
++    while (it < arr_end && *it != '{')
++      it++;
++    if (it >= arr_end)
++      break;
++    oend = match_pair(it);
++    if (!oend || oend > arr_end)
++      break;
++
++    count++;
++    memset(&tmp, 0, sizeof(tmp));
++    model_object_parse(it, oend, &tmp);
++
++    if (tmp.state == NVTOP_LLM_LOADED) {
++      if (info->loaded_count < NVTOP_LLM_MAX_LOADED)
++        info->models[info->loaded_count++] = tmp;
++    } else if (tmp.state == NVTOP_LLM_LOADING) {
++      loading++;
++      if (info->loaded_count < NVTOP_LLM_MAX_LOADED)
++        info->models[info->loaded_count++] = tmp;
++    }
++    it = oend + 1;
++  }
++
++  info->preset_count = count;
++  if (info->loaded_count == 0)
++    info->state = NVTOP_LLM_IDLE;
++  else if (loading && info->loaded_count == loading)
++    info->state = NVTOP_LLM_LOADING;
++  else
++    info->state = NVTOP_LLM_LOADED;
++}
++
++/* ------------------------------------------------------------------ */
++/* /metrics?model=...  (best effort, prometheus text)                  */
++/* ------------------------------------------------------------------ */
++
++static bool last_token_double(const char *line, size_t len, double *out) {
++  size_t end = len, start;
++  char tmp[64];
++  size_t n;
++
++  while (end > 0 && isspace((unsigned char)line[end - 1]))
++    end--;
++  start = end;
++  while (start > 0 && !isspace((unsigned char)line[start - 1]))
++    start--;
++  n = end - start;
++  if (!n)
++    return false;
++  if (n >= sizeof(tmp))
++    n = sizeof(tmp) - 1;
++  memcpy(tmp, line + start, n);
++  tmp[n] = '\0';
++
++  char *endp = NULL;
++  double v = strtod(tmp, &endp);
++  if (endp == tmp)
++    return false;
++  *out = v;
++  return true;
++}
++
++static void parse_prometheus(const char *text, nvtop_llm_model *model) {
++  const char *p = text;
++
++  while (*p) {
++    const char *nl = strchr(p, '\n');
++    size_t len = nl ? (size_t)(nl - p) : strlen(p);
++    double v;
++
++    if (len) {
++      const char *m = strstr(p, "kv_cache_usage_ratio");
++      if (m && (size_t)(m - p) < len) {
++        if (last_token_double(p, len, &v)) {
++          if (v > 1.0)
++            v = 1.0;
++          if (v < 0.0)
++            v = 0.0;
++          model->kv_usage_pct = (unsigned)(v * 100.0 + 0.5);
++          model->has_live_ctx = true;
++        }
++      } else if ((m = strstr(p, "kv_cache_tokens_total")) && (size_t)(m - p) < len) {
++        if (last_token_double(p, len, &v) && v >= 0.0)
++          model->kv_tokens_total = (uint64_t)v;
++      } else if ((m = strstr(p, "kv_cache_tokens")) && (size_t)(m - p) < len) {
++        if (last_token_double(p, len, &v) && v >= 0.0)
++          model->kv_tokens = (uint64_t)v;
++      }
++    }
++    if (!nl)
++      break;
++    p = nl + 1;
++  }
++}
++
++static void url_encode(const char *in, char *out, size_t cap) {
++  static const char hex[] = "0123456789ABCDEF";
++  size_t o = 0;
++
++  for (; *in && o + 4 < cap; in++) {
++    unsigned char c = (unsigned char)*in;
++    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
++      out[o++] = (char)c;
++    else {
++      out[o++] = '%';
++      out[o++] = hex[c >> 4];
++      out[o++] = hex[c & 0x0F];
++    }
++  }
++  out[o] = '\0';
++}
++
++/* ------------------------------------------------------------------ */
++/* Public API                                                          */
++/* ------------------------------------------------------------------ */
++
++static bool min_interval_elapsed(void) {
++  struct timespec now;
++  long ms;
++
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  ms = (now.tv_sec - g_last_poll.tv_sec) * 1000L + (now.tv_nsec - g_last_poll.tv_nsec) / 1000000L;
++  return ms >= LLM_MIN_POLL_MS;
++}
++
++bool nvtop_model_meter_poll(void) {
++  bool any = false;
++
++  servers_init();
++
++  if (!g_curl_ready) {
++    if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK)
++      return false;
++    g_curl = curl_easy_init();
++    if (!g_curl)
++      return false;
++    g_curl_ready = true;
++  }
++
++  if (g_ready && !min_interval_elapsed())
++    return true;
++
++  for (unsigned i = 0; i < g_def_count && i < NVTOP_LLM_MAX_SERVERS; i++) {
++    nvtop_model_meter_info *info = &g_servers[i];
++    long code = 0;
++
++    memset(info, 0, sizeof(*info));
++    snprintf(info->server_name, sizeof(info->server_name), "%s", g_defs[i].name);
++    snprintf(info->gpu_hint, sizeof(info->gpu_hint), "%s", g_defs[i].gpu_hint);
++    info->state = NVTOP_LLM_SERVER_DOWN;
++
++    if (!http_get(g_defs[i].host, LLM_MODELS_PATH, g_body, sizeof(g_body), &code))
++      continue;
++    if (code != 200)
++      continue;
++
++    info->reachable = true;
++    any = true;
++    parse_models_list(g_body, info);
++
++    if (info->loaded_count == 0)
++      continue;
++
++    /* Live KV load for each running model. If the router cannot serve it, back
++     * off rather than hammering its log with refused requests. */
++    if (g_metrics_backoff[i] > 0) {
++      g_metrics_backoff[i]--;
++      continue;
++    }
++
++    bool got_any = false;
++    for (unsigned k = 0; k < info->loaded_count; k++) {
++      char enc[NVTOP_LLM_MODEL_NAME_MAX * 3];
++      char path[NVTOP_LLM_MODEL_NAME_MAX * 3 + 32];
++
++      if (!info->models[k].model_name[0])
++        continue;
++      url_encode(info->models[k].model_name, enc, sizeof(enc));
++      snprintf(path, sizeof(path), "/metrics?model=%s", enc);
++      if (http_get(g_defs[i].host, path, g_body, sizeof(g_body), &code) && code == 200) {
++        parse_prometheus(g_body, &info->models[k]);
++        if (info->models[k].has_live_ctx)
++          got_any = true;
++      }
++    }
++    if (!got_any)
++      g_metrics_backoff[i] = LLM_METRICS_BACKOFF_POLLS;
++  }
++
++  g_ready = true;
++  clock_gettime(CLOCK_MONOTONIC, &g_last_poll);
++  return any;
++}
++
++unsigned nvtop_model_meter_count(void) {
++  servers_init();
++  return g_ready ? (unsigned)(g_def_count < NVTOP_LLM_MAX_SERVERS ? g_def_count : NVTOP_LLM_MAX_SERVERS) : 0;
++}
++
++const nvtop_model_meter_info *nvtop_model_meter_get(unsigned idx) {
++  if (!g_ready || idx >= g_def_count || idx >= NVTOP_LLM_MAX_SERVERS)
++    return NULL;
++  return &g_servers[idx];
++}
++
++static bool contains_nocase(const char *haystack, const char *needle) {
++  size_t nlen = strlen(needle);
++
++  if (!nlen)
++    return false;
++  for (; *haystack; haystack++) {
++    size_t i = 0;
++    while (i < nlen && haystack[i] && tolower((unsigned char)haystack[i]) == tolower((unsigned char)needle[i]))
++      i++;
++    if (i == nlen)
++      return true;
++  }
++  return false;
++}
++
++const nvtop_model_meter_info *nvtop_model_meter_for_gpu(const char *gpu_name) {
++  if (!g_ready || !gpu_name || !gpu_name[0])
++    return NULL;
++  for (unsigned i = 0; i < g_def_count && i < NVTOP_LLM_MAX_SERVERS; i++) {
++    if (g_servers[i].gpu_hint[0] && contains_nocase(gpu_name, g_servers[i].gpu_hint))
++      return &g_servers[i];
++  }
++  return NULL;
++}
++
++void nvtop_model_meter_shutdown(void) {
++  if (g_curl) {
++    curl_easy_cleanup(g_curl);
++    g_curl = NULL;
++  }
++  if (g_curl_ready)
++    curl_global_cleanup();
++  g_curl_ready = false;
++  g_ready = false;
++}
+diff -ruN a/src/nvtop.c b/src/nvtop.c
+--- a/src/nvtop.c	2026-10-07 15:12:23.294245878 +0300
++++ b/src/nvtop.c	2026-10-07 15:12:23.327579209 +0300
+@@ -24,6 +24,7 @@
+ #include "nvtop/interface.h"
+ #include "nvtop/interface_common.h"
+ #include "nvtop/interface_options.h"
++#include "nvtop/model_meter_c.h"
+ #include "nvtop/time.h"
+ #include "nvtop/version.h"
+ 
+@@ -280,6 +281,9 @@
+       initialize_curses(allDevCount, numMonitoredGpus, interface_largest_gpu_name(&monitoredGpus), allDevicesOptions);
+   timeout(interface_update_interval(interface));
+ 
++  /* First LLM model meter poll */
++  nvtop_model_meter_poll();
++
+   double time_slept = interface_update_interval(interface);
+   while (!signal_exit) {
+     if (signal_resize_win) {
+@@ -354,6 +358,9 @@
+     }
+   }
+ 
++  /* Shutdown LLM model meter */
++  nvtop_model_meter_shutdown();
++
+   clean_ncurses(interface);
+   gpuinfo_shutdown_info_extraction(&monitoredGpus);
+ 
