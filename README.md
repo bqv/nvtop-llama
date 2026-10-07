@@ -52,8 +52,16 @@ applied by `eapply_user`, which `cmake.eclass` already calls:
 sudo install -d          /etc/portage/patches/sys-process/nvtop-3.3.2
 sudo install -m 644 patches/nvtop-3.3.2-llama-meter.patch \
                          /etc/portage/patches/sys-process/nvtop-3.3.2/llama-meter.patch
-sudo emerge -1 nvtop
+sudo emerge -1 --usepkg=n --getbinpkg=n nvtop
 ```
+
+**`--usepkg=n --getbinpkg=n` is not optional if you run a binhost.** A binary
+package is built elsewhere and never runs `src_prepare`, so `eapply_user` never
+runs and this patch is skipped — with a normal-looking merge, exit 0, and no
+warning anywhere. Plain `emerge -1 nvtop` will silently hand you an unpatched
+binary. The tell is in the log: `* Applying user patches from
+/etc/portage/patches ...` then `* Applying llama-meter.patch ...`. If those lines
+are absent, the patch did not go in.
 
 Patches are version specific on purpose: `interface.c` differs by hundreds of
 lines between releases, so a single generic patch would fail to apply and break
