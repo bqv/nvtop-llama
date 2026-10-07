@@ -22,7 +22,7 @@ LLM llama  Qwen3.5-35B-A3B-UD-IQ4_XS-240k
 ctx 246k  train 256k  17.5G  34.7B  IQ4_XS  kv q8_0/q8_0
 ```
 
-A GPU with no router mapped to it shows `LLM -` rather than a blank gap.
+A GPU with no router mapped to it gets **no** meter band at all, and reserves no rows: meter rows are counted per header stack, and a stack is only as tall as its tallest member. Every GPU section is therefore separated by at most one blank row.
 
 ## What it reads
 
@@ -104,9 +104,12 @@ Format is `name=host:port=gpu_hint`, entries separated by `;`.
 
 The meter is a real window on rows the layout reserves for it, never a
 subwindow — every nvtop info line is exactly one row tall, so a taller subwindow
-spills over the plots. On each resize nvtop tries the tallest meter that keeps
-every chart and leaves a usable plot area, falling back a row at a time and
-finally to no meter at all, so the graphs are never lost to it.
+spills over the plots. `compute_sizes_from_layout()` takes a per-device row
+count and charges it to the header *stack*, so a GPU with no router reserves
+nothing and cannot leave a blank band behind. On each resize nvtop tries the
+tallest meter that keeps every chart and leaves a usable plot area, falling back
+a row at a time and finally to no meter at all, so the graphs are never lost to
+it.
 
 ## Regenerating the patches
 
