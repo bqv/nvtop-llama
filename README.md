@@ -189,6 +189,23 @@ Tested by `tests/prefill-test.py`: four phases against a stub router (prefill in
 flight, prompt finished, mostly-cached prompt, loaded but idle), one of which
 serves whitespace-separated JSON so the parser stays tolerant of that.
 
+### Why the bar is eased
+
+The router's `n_prompt_tokens_processed` advances a whole *logical batch* at a
+time (`-b`, 2048 by default), so on fast hardware the raw figure jumps about 5%
+at once -- roughly every 0.66 s, and only ~21 steps for a 43k prompt. No polling
+interval makes that finer, so the bar is eased towards the last value the router
+reported: it then advances every frame, while the printed percentage and the
+token counts stay exactly what was reported. The fill trails the number by less
+than one batch, which is not visible.
+
+`tests/ease-test.c` unit-tests that step -- monotone, never past the target,
+largest single-frame move 2.25%, and a backwards value (a new request) taken
+immediately instead of eased. It is a *unit* test on purpose: the UI harness
+cannot see this, because it scrapes the pty stream and ncurses writes only the
+characters that changed, so successive frames of one line cannot be recovered
+from it.
+
 ### Poll cadence
 
 The router is polled adaptively, because a fixed interval is wrong in both

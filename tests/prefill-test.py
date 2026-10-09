@@ -53,6 +53,9 @@ class H(http.server.BaseHTTPRequestHandler):
             REQS["slots"] += 1
             # Key order matters: is_processing precedes the counters, as on the
             # real router, and the poller parses forward from that match.
+            # The real router advances a whole logical batch at a time, so a
+            # coarse counter is modelled: step only every Nth request.
+            STATE["req"] = STATE.get("req", 0) + 1
             slot = {"id": 0, "n_ctx": 131072, "speculative": False,
                     "is_processing": STATE["processing"], "id_task": 7,
                     "n_prompt_tokens": STATE["total"],
@@ -60,7 +63,8 @@ class H(http.server.BaseHTTPRequestHandler):
                     "n_prompt_tokens_cache": STATE["cached"]}
             self._send(json.dumps([slot], separators=(", ", ": ") if STATE["spaced"] else (",", ":")).encode(),
                        "application/json")
-            STATE["processed"] += STATE["advance"]
+            if STATE["req"] % STATE.get("advance_every", 1) == 0:
+                STATE["processed"] += STATE["advance"]
         elif p.path == "/metrics":
             REQS["metrics"] += 1
             self._send((f'llamacpp:kv_cache_usage_ratio{{model="{NAME}"}} 0.75\n'
@@ -122,6 +126,12 @@ def main():
     d = run("D: loaded but idle", {
         "no PREF bar when nothing is processing": lambda t, p: "PREF[" not in t,
     })
+
+    # The easing of the bar between coarse counter steps is NOT tested here: this
+    # harness scrapes the pty stream, and ncurses writes only the characters that
+    # changed, so successive frames of one line cannot be recovered -- the
+    # fragments join into a line that never existed on screen. It is unit-tested
+    # instead, in tests/ease-test.c, against the pure step function.
 
     srv.shutdown()
     print("=" * 70)

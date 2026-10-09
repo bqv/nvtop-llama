@@ -1,6 +1,6 @@
 diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_internal_common.h
---- a/include/nvtop/interface_internal_common.h	2026-10-09 18:29:30.998973062 +0300
-+++ b/include/nvtop/interface_internal_common.h	2026-10-09 18:29:31.011030215 +0300
+--- a/include/nvtop/interface_internal_common.h	2026-10-09 18:52:02.232304395 +0300
++++ b/include/nvtop/interface_internal_common.h	2026-10-09 18:52:02.243117035 +0300
 @@ -82,6 +82,7 @@
    // Generic grid of extra GPU information (clock domains and static specs); each
    // cell holds one "NAME value" field. Unused slots are NULL.
@@ -10,8 +10,8 @@ diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_
    bool dec_was_visible;
    nvtop_time last_decode_seen;
 diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface_layout_selection.h
---- a/include/nvtop/interface_layout_selection.h	2026-10-09 18:29:30.998973062 +0300
-+++ b/include/nvtop/interface_layout_selection.h	2026-10-09 18:29:31.011030215 +0300
+--- a/include/nvtop/interface_layout_selection.h	2026-10-09 18:52:02.232304395 +0300
++++ b/include/nvtop/interface_layout_selection.h	2026-10-09 18:52:02.243117035 +0300
 @@ -16,6 +16,7 @@
  void compute_sizes_from_layout(unsigned monitored_dev_count, unsigned device_header_rows, unsigned device_header_cols,
                                 unsigned rows, unsigned cols, const nvtop_interface_gpu_opts *gpu_opts,
@@ -22,8 +22,8 @@ diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface
                                 struct window_position *process_position, struct window_position *setup_position,
 diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 --- a/include/nvtop/model_meter_c.h	1970-01-01 02:00:00.000000000 +0200
-+++ b/include/nvtop/model_meter_c.h	2026-10-09 18:29:31.011030215 +0300
-@@ -0,0 +1,129 @@
++++ b/include/nvtop/model_meter_c.h	2026-10-09 18:52:02.243117035 +0300
+@@ -0,0 +1,149 @@
 +/*
 + *
 + * Copyright (C) 2025 DSH User
@@ -117,6 +117,26 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +  double prefill_eta_s;            /* 0 when unknown */
 +} nvtop_llm_model;
 +
++/* One frame of progress-bar easing.
++ *
++ * llama.cpp's processed-token counter advances a whole logical batch at a time
++ * (-b, 2048 by default), so on fast hardware the figure the router reports jumps
++ * several percent at once and a bar drawn straight from it moves in lurches. The
++ * bar is eased towards the reported value instead, so it advances every frame
++ * while the printed percentage and token counts stay exactly what was reported.
++ *
++ * Pure, so it can be tested on its own: never downwards, never past the target,
++ * and a value that has gone backwards (a new request) is taken immediately
++ * rather than eased. */
++static inline double nvtop_llm_ease_step(double shown, double target) {
++  if (target <= shown)
++    return target;
++  shown += (target - shown) * 0.25;
++  if (target - shown < 0.4)
++    shown = target;
++  return shown;
++}
++
 +/* One llama.cpp router server, mapped to one GPU */
 +typedef struct nvtop_model_meter_info {
 +  char server_name[NVTOP_LLM_SERVER_NAME_MAX]; /* "llama" */
@@ -154,8 +174,8 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +
 +#endif /* NVTOP_MODEL_METER_C_H__ */
 diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
---- a/src/CMakeLists.txt	2026-10-09 18:29:31.000025832 +0300
-+++ b/src/CMakeLists.txt	2026-10-09 18:29:31.014198770 +0300
+--- a/src/CMakeLists.txt	2026-10-09 18:52:02.233554271 +0300
++++ b/src/CMakeLists.txt	2026-10-09 18:52:02.245039653 +0300
 @@ -17,6 +17,7 @@
    time.c
    plot.c
@@ -178,8 +198,8 @@ diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
    PRIVATE ncurses m ${CMAKE_DL_LIBS})
  
 diff -ruN a/src/interface.c b/src/interface.c
---- a/src/interface.c	2026-10-09 18:29:31.000437249 +0300
-+++ b/src/interface.c	2026-10-09 18:29:31.014198770 +0300
+--- a/src/interface.c	2026-10-09 18:52:02.233721044 +0300
++++ b/src/interface.c	2026-10-09 18:52:02.245039653 +0300
 @@ -28,6 +28,7 @@
  #include "nvtop/interface_options.h"
  #include "nvtop/interface_ring_buffer.h"
@@ -322,7 +342,7 @@ diff -ruN a/src/interface.c b/src/interface.c
    }
  
    alloc_process_with_option(dwin, process_position.posX, process_position.posY, process_position.sizeX,
-@@ -962,6 +1038,293 @@
+@@ -962,6 +1038,341 @@
    return NULL;
  }
  
@@ -424,9 +444,56 @@ diff -ruN a/src/interface.c b/src/interface.c
 +  mvwprintw(win, row, label + 2 + bar, "%.*s", cols - (label + 2 + bar) - 1, tail);
 +}
 +
++/*
++ * The router's processed-token counter is quantised by llama.cpp's logical batch
++ * (-b, 2048 by default): it advances a whole batch at a time, which on a fast GPU
++ * is a jump of several percent roughly every 0.6 s -- only ~21 steps for a 43k
++ * prompt. No polling makes that finer, so the bar is eased towards the last value
++ * the router reported instead: it then moves every frame, while the printed
++ * percentage and the token counts stay exactly what was reported. The fill trails
++ * the number by less than one batch, which is not visible.
++ */
++#define LLM_EASE_MAX 8
++static struct {
++  char key[NVTOP_LLM_MODEL_NAME_MAX * 2];
++  long task;
++  double shown;
++} g_ease[LLM_EASE_MAX];
++
++static double llm_ease_fill(const char *server, const nvtop_llm_model *m) {
++  char key[NVTOP_LLM_MODEL_NAME_MAX * 2];
++  double target = (double)m->prefill_pct;
++  unsigned slot = LLM_EASE_MAX, free_slot = LLM_EASE_MAX;
++
++  snprintf(key, sizeof(key), "%s/%s", server, m->model_name);
++  for (unsigned i = 0; i < LLM_EASE_MAX; i++) {
++    if (g_ease[i].key[0] && strcmp(g_ease[i].key, key) == 0) {
++      slot = i;
++      break;
++    }
++    if (free_slot == LLM_EASE_MAX && !g_ease[i].key[0])
++      free_slot = i;
++  }
++  if (slot == LLM_EASE_MAX) {
++    slot = free_slot == LLM_EASE_MAX ? 0 : free_slot;
++    snprintf(g_ease[slot].key, sizeof(g_ease[slot].key), "%s", key);
++    g_ease[slot].task = m->prefill_task;
++    g_ease[slot].shown = target;
++    return target; /* first sighting: nothing to ease towards */
++  }
++  if (g_ease[slot].task != m->prefill_task) {
++    g_ease[slot].task = m->prefill_task; /* a new request: start from the truth */
++    g_ease[slot].shown = target;
++    return target;
++  }
++  g_ease[slot].shown = nvtop_llm_ease_step(g_ease[slot].shown, target);
++  return g_ease[slot].shown;
++}
++
 +/* Prefill progress bar, drawn on the same row as the others: how much of the
 + * request's prompt the router has read. Exact, straight from /slots. */
-+static void llm_draw_prefill_bar(WINDOW *win, int row, int cols, const nvtop_llm_model *m) {
++static void llm_draw_prefill_bar(WINDOW *win, int row, int cols, const char *server,
++                                 const nvtop_llm_model *m) {
 +  char tail[192];
 +  int label = 4, bar, filled;
 +
@@ -442,7 +509,8 @@ diff -ruN a/src/interface.c b/src/interface.c
 +  bar = cols - label - 3 - (int)strlen(tail);
 +  if (bar < 1)
 +    bar = 1;
-+  filled = (int)((double)bar * (double)m->prefill_pct / 100.0);
++  /* Only the fill is eased; the numbers above are the router's own. */
++  filled = (int)((double)bar * llm_ease_fill(server, m) / 100.0);
 +  if (filled > bar)
 +    filled = bar;
 +
@@ -563,7 +631,7 @@ diff -ruN a/src/interface.c b/src/interface.c
 +        mvwprintw(win, 1, 0, "%.*s", cols - 1, "reading weights, no progress signal yet");
 +    } else if (m->has_prefill) {
 +      /* A prompt being read is more interesting than how full the window is. */
-+      llm_draw_prefill_bar(win, 1, cols, m);
++      llm_draw_prefill_bar(win, 1, cols, info->server_name, m);
 +    } else if (m->has_live_ctx) {
 +      llm_draw_ctx_bar(win, 1, cols, m);
 +    } else {
@@ -616,7 +684,7 @@ diff -ruN a/src/interface.c b/src/interface.c
  static void draw_devices(struct list_head *devices, struct nvtop_interface *interface) {
    struct gpu_info *device;
    unsigned dev_id = 0;
-@@ -1305,6 +1668,17 @@
+@@ -1305,6 +1716,17 @@
        wnoutrefresh(dev->extra_info[extra_slot]);
      }
  
@@ -634,7 +702,7 @@ diff -ruN a/src/interface.c b/src/interface.c
      dev_id++;
    }
  }
-@@ -2300,6 +2674,9 @@
+@@ -2300,6 +2722,9 @@
  
  void draw_gpu_info_ncurses(unsigned devices_count, struct list_head *devices, struct nvtop_interface *interface) {
  
@@ -645,8 +713,8 @@ diff -ruN a/src/interface.c b/src/interface.c
    draw_devices(devices, interface);
    if (!interface->setup_win.visible) {
 diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
---- a/src/interface_layout_selection.c	2026-10-09 18:29:31.000437249 +0300
-+++ b/src/interface_layout_selection.c	2026-10-09 18:29:31.014198770 +0300
+--- a/src/interface_layout_selection.c	2026-10-09 18:52:02.233721044 +0300
++++ b/src/interface_layout_selection.c	2026-10-09 18:52:02.245039653 +0300
 @@ -232,7 +232,8 @@
  }
  void compute_sizes_from_layout(unsigned devices_count, unsigned device_header_rows, unsigned device_header_cols,
@@ -706,7 +774,7 @@ diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
        headerPosX += device_header_cols + space_between_header_col;
 diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 --- a/src/llm_poller.c	1970-01-01 02:00:00.000000000 +0200
-+++ b/src/llm_poller.c	2026-10-09 18:29:31.014198770 +0300
++++ b/src/llm_poller.c	2026-10-09 18:52:02.247054377 +0300
 @@ -0,0 +1,1031 @@
 +/*
 + *
@@ -1740,8 +1808,8 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +  g_ready = false;
 +}
 diff -ruN a/src/nvtop.c b/src/nvtop.c
---- a/src/nvtop.c	2026-10-09 18:29:31.000437249 +0300
-+++ b/src/nvtop.c	2026-10-09 18:29:31.014198770 +0300
+--- a/src/nvtop.c	2026-10-09 18:52:02.233721044 +0300
++++ b/src/nvtop.c	2026-10-09 18:52:02.247054377 +0300
 @@ -24,6 +24,7 @@
  #include "nvtop/interface.h"
  #include "nvtop/interface_common.h"
