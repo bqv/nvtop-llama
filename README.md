@@ -154,6 +154,41 @@ The test for this is `tests/load-test.py`, driven by the `tests/fake-load.c`
 fixture: a stub router claims a model is loading while a fake `llama-server`
 child does real `O_DIRECT` reads of a GGUF. No model server is involved.
 
+## Prefill progress
+
+While a request's prompt is being read, the same line shows how much of it has
+been processed:
+
+    LLM llama  Qwen3.5-35B-A3B-abliterated-128k
+    PREF[||||||||||||||||||||||||||||||||||||        ] 95%  41.4k/43.5k tokens  3.1k tok/s  eta 1s
+
+Unlike the load bar this is not inferred -- the router reports it directly.
+`GET /slots?model=<id>` (on a router `?model=` is required; bare `/slots` answers
+HTTP 400) returns the slot handling the task with `n_prompt_tokens` and
+`n_prompt_tokens_processed`, and the percentage is their ratio.
+
+The details that decide whether the figure is honest:
+
+ - `is_processing` is true during decode too, when `processed == total`. The bar
+   therefore appears only while a prompt is still being read; when it finishes the
+   context bar takes the line back, rather than a bar frozen at 100%.
+ - `n_prompt_tokens_cache` is shown when non-zero, so a prompt that was mostly
+   reused from cache reads as a cache hit rather than as suspiciously instant.
+ - Every slot is examined, not just the first, since with `--parallel > 1` the
+   first may be idle while a later one is working.
+ - `id_task` changes with each request and resets the rate, so a new prompt cannot
+   inherit the previous one's tokens/s. Rate and ETA come from the delta between
+   polls, not from timing the bar.
+
+That one row is chosen by what the model is doing: the load bar while it is
+loading, the prefill bar while a prompt is being read, otherwise the context bar
+or the static facts. **No extra rows are used** -- the meter band is exactly as
+tall as it was.
+
+Tested by `tests/prefill-test.py`: three phases against a stub router (prefill in
+flight, prompt finished, mostly-cached prompt), one of which serves
+whitespace-separated JSON so the parser stays tolerant of that.
+
 ## Tests
 
 - `tests/stub-test.py` — serves a canned router (two models running, one
