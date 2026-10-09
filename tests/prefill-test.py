@@ -20,6 +20,11 @@ NAME = "Qwen3.5-35B-A3B-abliterated-128k"
 STATE = {"processed": 41408, "total": 43456, "cached": 0, "processing": True, "advance": 0,
          "spaced": False}
 
+# Requests actually served, per phase: the point of the adaptive cadence is that
+# this drops when nothing is happening.
+REQS = {"models": 0, "slots": 0, "metrics": 0}
+COUNTS = {}
+
 
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -35,6 +40,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
         if p.path == "/v1/models":
+            REQS["models"] += 1
             body = {"data": [{"id": NAME, "object": "model",
                     "status": {"value": "loaded", "preset": "",
                                "args": ["/usr/bin/llama-server", "--ctx-size", "131072",
@@ -44,6 +50,7 @@ class H(http.server.BaseHTTPRequestHandler):
             self._send(json.dumps(body, separators=(", ", ": ") if STATE["spaced"] else (",", ":")).encode(),
                        "application/json")
         elif p.path == "/slots":
+            REQS["slots"] += 1
             # Key order matters: is_processing precedes the counters, as on the
             # real router, and the poller parses forward from that match.
             slot = {"id": 0, "n_ctx": 131072, "speculative": False,
@@ -55,6 +62,7 @@ class H(http.server.BaseHTTPRequestHandler):
                        "application/json")
             STATE["processed"] += STATE["advance"]
         elif p.path == "/metrics":
+            REQS["metrics"] += 1
             self._send((f'llamacpp:kv_cache_usage_ratio{{model="{NAME}"}} 0.75\n'
                         f'llamacpp:kv_cache_tokens{{model="{NAME}"}} 98304\n'
                         f'llamacpp:kv_cache_tokens_total{{model="{NAME}"}} 131072\n').encode(),
@@ -69,6 +77,7 @@ def run(name, expect):
     env["TERM"] = "xterm-256color"
     env.pop("LINES", None)
     env.pop("COLUMNS", None)
+    REQS.update(models=0, slots=0, metrics=0)
     subprocess.run(["timeout", "3", "script", "-qc",
                     f"stty rows 50 cols 200; {NVTOP} -d 5", RAW],
                    env=env, capture_output=True, timeout=30)
@@ -79,6 +88,8 @@ def run(name, expect):
     for line in txt.split("\n"):
         if any(k in line for k in ("PREF", "CTX", "LOAD", "LLM")):
             print("   ", line.rstrip()[:150])
+    COUNTS[name] = dict(REQS)
+    print(f"    requests served in 3 s: {REQS}")
     pcts = [int(v) for v in re.findall(r"PREF\[[^\]]*\]\s+(\d+)%", txt)]
     return {label: cond(txt, pcts) for label, cond in expect.items()}
 
@@ -107,12 +118,20 @@ def main():
         "cache figure visible": lambda t, p: "cached" in t,
     })
 
+    STATE.update(processed=0, total=0, cached=0, processing=False, advance=0, spaced=False)
+    d = run("D: loaded but idle", {
+        "no PREF bar when nothing is processing": lambda t, p: "PREF[" not in t,
+    })
+
     srv.shutdown()
     print("=" * 70)
     print("checks")
     print("=" * 70)
+    a["cadence fast while a prompt is read"] = COUNTS["A: prefill in flight"]["models"] >= 5
+    d["cadence slow while idle"] = COUNTS["D: loaded but idle"]["models"] <= 3
+    print("  polls/3s: " + "  ".join(f"{k.split(':')[0]}={v['models']}" for k, v in COUNTS.items()))
     bad = 0
-    for phase, res in (("A", a), ("B", b), ("C", c)):
+    for phase, res in (("A", a), ("B", b), ("C", c), ("D", d)):
         for k, v in res.items():
             print(f"  [{'PASS' if v else 'FAIL'}] {phase}: {k}")
             bad += 0 if v else 1

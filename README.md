@@ -185,9 +185,29 @@ loading, the prefill bar while a prompt is being read, otherwise the context bar
 or the static facts. **No extra rows are used** -- the meter band is exactly as
 tall as it was.
 
-Tested by `tests/prefill-test.py`: three phases against a stub router (prefill in
-flight, prompt finished, mostly-cached prompt), one of which serves
-whitespace-separated JSON so the parser stays tolerant of that.
+Tested by `tests/prefill-test.py`: four phases against a stub router (prefill in
+flight, prompt finished, mostly-cached prompt, loaded but idle), one of which
+serves whitespace-separated JSON so the parser stays tolerant of that.
+
+### Poll cadence
+
+The router is polled adaptively, because a fixed interval is wrong in both
+directions. The meter is redrawn at nvtop's refresh rate (0.1 s by default), so
+the old fixed 1.2 s poll is what made the bars look like they ran at about 1 fps
+-- the frames were there, the numbers were not. Polling quickly also costs the
+router a moment on its task lock, so polling fastest while idle is the worst
+possible default.
+
+| state | interval |
+| --- | --- |
+| a model is loading, or a prompt is being read | 300 ms |
+| a loaded model is decoding | 900 ms |
+| loaded, nothing in flight | 2 s |
+| nothing loaded, or the router is not answering | 5 s |
+
+`tests/prefill-test.py` counts the requests each phase actually serves, so the
+tiers are checked rather than assumed: 6 polls per 3 s while a prompt is being
+read, against 2 per 3 s when idle.
 
 ## Tests
 

@@ -1,6 +1,6 @@
 diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_internal_common.h
---- a/include/nvtop/interface_internal_common.h	2026-10-09 17:55:10.676587851 +0300
-+++ b/include/nvtop/interface_internal_common.h	2026-10-09 17:55:10.681749782 +0300
+--- a/include/nvtop/interface_internal_common.h	2026-10-09 18:29:26.585592741 +0300
++++ b/include/nvtop/interface_internal_common.h	2026-10-09 18:29:26.603770743 +0300
 @@ -68,6 +68,7 @@
    WINDOW *shader_cores;
    WINDOW *l2_cache_size;
@@ -10,8 +10,8 @@ diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_
    bool dec_was_visible;
    nvtop_time last_decode_seen;
 diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface_layout_selection.h
---- a/include/nvtop/interface_layout_selection.h	2026-10-09 17:55:10.676587851 +0300
-+++ b/include/nvtop/interface_layout_selection.h	2026-10-09 17:55:10.681749782 +0300
+--- a/include/nvtop/interface_layout_selection.h	2026-10-09 18:29:26.585592741 +0300
++++ b/include/nvtop/interface_layout_selection.h	2026-10-09 18:29:26.603770743 +0300
 @@ -16,6 +16,7 @@
  void compute_sizes_from_layout(unsigned monitored_dev_count, unsigned device_header_rows, unsigned device_header_cols,
                                 unsigned rows, unsigned cols, const nvtop_interface_gpu_opts *gpu_opts,
@@ -22,8 +22,8 @@ diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface
                                 struct window_position *process_position, struct window_position *setup_position);
 diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 --- a/include/nvtop/model_meter_c.h	1970-01-01 02:00:00.000000000 +0200
-+++ b/include/nvtop/model_meter_c.h	2026-10-09 17:55:10.681749782 +0300
-@@ -0,0 +1,128 @@
++++ b/include/nvtop/model_meter_c.h	2026-10-09 18:29:26.603770743 +0300
+@@ -0,0 +1,129 @@
 +/*
 + *
 + * Copyright (C) 2025 DSH User
@@ -112,6 +112,7 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +  unsigned long prefill_processed; /* n_prompt_tokens_processed */
 +  unsigned long prefill_cached;    /* n_prompt_tokens_cache */
 +  long prefill_task;               /* id_task: changes with each request */
++  bool slot_processing;            /* is_processing: true while decoding too */
 +  double prefill_tok_per_s;        /* 0 until two samples of the same task */
 +  double prefill_eta_s;            /* 0 when unknown */
 +} nvtop_llm_model;
@@ -153,8 +154,8 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +
 +#endif /* NVTOP_MODEL_METER_C_H__ */
 diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
---- a/src/CMakeLists.txt	2026-10-09 17:55:10.677436113 +0300
-+++ b/src/CMakeLists.txt	2026-10-09 17:55:10.683194251 +0300
+--- a/src/CMakeLists.txt	2026-10-09 18:29:26.586471766 +0300
++++ b/src/CMakeLists.txt	2026-10-09 18:29:26.613609880 +0300
 @@ -16,6 +16,7 @@
    time.c
    plot.c
@@ -177,8 +178,8 @@ diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
    PRIVATE ncurses m ${CMAKE_DL_LIBS})
  
 diff -ruN a/src/interface.c b/src/interface.c
---- a/src/interface.c	2026-10-09 17:55:10.677436113 +0300
-+++ b/src/interface.c	2026-10-09 17:55:10.683194251 +0300
+--- a/src/interface.c	2026-10-09 18:29:26.586471766 +0300
++++ b/src/interface.c	2026-10-09 18:29:26.613770743 +0300
 @@ -29,6 +29,7 @@
  #include "nvtop/interface_options.h"
  #include "nvtop/interface_ring_buffer.h"
@@ -647,8 +648,8 @@ diff -ruN a/src/interface.c b/src/interface.c
    if (!interface->setup_win.visible) {
      draw_plots(interface);
 diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
---- a/src/interface_layout_selection.c	2026-10-09 17:55:10.677436113 +0300
-+++ b/src/interface_layout_selection.c	2026-10-09 17:55:10.683194251 +0300
+--- a/src/interface_layout_selection.c	2026-10-09 18:29:26.586471766 +0300
++++ b/src/interface_layout_selection.c	2026-10-09 18:29:26.613770743 +0300
 @@ -233,7 +233,8 @@
  
  void compute_sizes_from_layout(unsigned devices_count, unsigned device_header_rows, unsigned device_header_cols,
@@ -708,8 +709,8 @@ diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
        headerPosX += device_header_cols + space_between_header_col;
 diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 --- a/src/llm_poller.c	1970-01-01 02:00:00.000000000 +0200
-+++ b/src/llm_poller.c	2026-10-09 17:55:10.683194251 +0300
-@@ -0,0 +1,988 @@
++++ b/src/llm_poller.c	2026-10-09 18:29:26.613770743 +0300
+@@ -0,0 +1,1031 @@
 +/*
 + *
 + * Copyright (C) 2025 DSH User
@@ -814,7 +815,19 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +
 +#define LLM_MODELS_PATH "/v1/models"
 +#define LLM_BODY_MAX (512u * 1024u)
-+#define LLM_MIN_POLL_MS 1200
++/*
++ * Poll cadence. The meter is redrawn at nvtop's refresh rate (0.1 s by
++ * default), so a fixed 1.2 s poll was what made the bars look like ~1 fps: the
++ * frames were there, the numbers were not. Polling quickly also costs the
++ * router a moment on its task lock, so the fast tier is reserved for the states
++ * worth watching and idle is deliberately slow.
++ */
++#define LLM_POLL_FAST_MS 300   /* a model is loading, or a prompt is being read */
++#define LLM_POLL_ACTIVE_MS 900 /* a loaded model is decoding */
++#define LLM_POLL_IDLE_MS 2000  /* loaded, nothing in flight */
++#define LLM_POLL_COLD_MS 5000  /* nothing loaded, or the router is not answering */
++
++static unsigned g_poll_ms = LLM_POLL_IDLE_MS;
 +
 +/* When a router cannot serve /metrics, do not retry it on every single poll:
 + * each refused request lands in the router log. */
@@ -1489,6 +1502,7 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +
 +  if (!p)
 +    return;
++  m->slot_processing = true;
 +  if (!json_uint_after(p, "n_prompt_tokens", &total))
 +    return;
 +  if (!json_uint_after(p, "n_prompt_tokens_processed", &done))
@@ -1546,7 +1560,7 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +
 +  clock_gettime(CLOCK_MONOTONIC, &now);
 +  ms = (now.tv_sec - g_last_poll.tv_sec) * 1000L + (now.tv_nsec - g_last_poll.tv_nsec) / 1000000L;
-+  return ms >= LLM_MIN_POLL_MS;
++  return ms >= (long)g_poll_ms;
 +}
 +
 +bool nvtop_model_meter_poll(void) {
@@ -1634,6 +1648,36 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +      g_metrics_backoff[i] = LLM_METRICS_BACKOFF_POLLS;
 +  }
 +
++  /* Choose the next interval from what was just seen. NVTOP_LLM_SERVER_DOWN is
++   * the "did not answer" state, so it needs no separate reachability test. */
++  {
++    unsigned want = LLM_POLL_COLD_MS;
++
++    for (unsigned i = 0; i < g_def_count && i < NVTOP_LLM_MAX_SERVERS; i++) {
++      const nvtop_model_meter_info *info = &g_servers[i];
++
++      if (info->state == NVTOP_LLM_SERVER_DOWN)
++        continue;
++      if (info->state == NVTOP_LLM_LOADING) {
++        want = LLM_POLL_FAST_MS;
++        break;
++      }
++      for (unsigned k = 0; k < info->loaded_count; k++) {
++        if (info->models[k].has_prefill) {
++          want = LLM_POLL_FAST_MS;
++          break;
++        }
++        if (info->models[k].slot_processing && want > LLM_POLL_ACTIVE_MS)
++          want = LLM_POLL_ACTIVE_MS;
++      }
++      if (want == LLM_POLL_FAST_MS)
++        break;
++      if (info->loaded_count > 0 && want > LLM_POLL_IDLE_MS)
++        want = LLM_POLL_IDLE_MS;
++    }
++    g_poll_ms = want;
++  }
++
 +  g_ready = true;
 +  clock_gettime(CLOCK_MONOTONIC, &g_last_poll);
 +  return any;
@@ -1699,8 +1743,8 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +  g_ready = false;
 +}
 diff -ruN a/src/nvtop.c b/src/nvtop.c
---- a/src/nvtop.c	2026-10-09 17:55:10.677436113 +0300
-+++ b/src/nvtop.c	2026-10-09 17:55:10.683194251 +0300
+--- a/src/nvtop.c	2026-10-09 18:29:26.586471766 +0300
++++ b/src/nvtop.c	2026-10-09 18:29:26.613770743 +0300
 @@ -34,6 +34,7 @@
  #include "nvtop/interface.h"
  #include "nvtop/interface_common.h"
