@@ -49,9 +49,12 @@ User patches go in `/etc/portage/patches/<category>/<package>-<version>/` and ar
 applied by `eapply_user`, which `cmake.eclass` already calls:
 
 ```sh
-sudo install -d          /etc/portage/patches/sys-process/nvtop-3.3.2
-sudo install -m 644 patches/nvtop-3.3.2-llama-meter.patch \
-                         /etc/portage/patches/sys-process/nvtop-3.3.2/llama-meter.patch
+V=3.3.2
+P=/etc/portage/patches/sys-process/nvtop-$V
+sudo install -d "$P"
+sudo install -m 644 patches/chart-stack-posx.patch             "$P/chart-stack-posx.patch"
+sudo install -m 644 patches/nvtop-$V-clock-percent-clamp.patch "$P/clock-percent-clamp.patch"
+sudo install -m 644 patches/nvtop-$V-llama-meter.patch         "$P/llama-meter.patch"
 sudo emerge -1 --usepkg=n --getbinpkg=n nvtop
 ```
 
@@ -60,8 +63,9 @@ package is built elsewhere and never runs `src_prepare`, so `eapply_user` never
 runs and this patch is skipped — with a normal-looking merge, exit 0, and no
 warning anywhere. Plain `emerge -1 nvtop` will silently hand you an unpatched
 binary. The tell is in the log: `* Applying user patches from
-/etc/portage/patches ...` then `* Applying llama-meter.patch ...`. If those lines
-are absent, the patch did not go in.
+/etc/portage/patches ...` then one line per patch, `* Applying
+chart-stack-posx.patch ...`, `clock-percent-clamp.patch`, `llama-meter.patch`. If
+those lines are absent, the patch did not go in.
 
 Patches are version specific on purpose: `interface.c` differs by hundreds of
 lines between releases, so a single generic patch would fail to apply and break
@@ -121,6 +125,56 @@ python3 tools/port.py <pristine-nvtop-tree>
 copies the two new files in and applies every edit by asserted anchor, so an
 unrecognised tree fails loudly instead of producing broken code. Then diff the
 result against the pristine tree to make the patch.
+
+## Two fixes to nvtop's charts
+
+Both of these are bugs in nvtop rather than in the meter, so they sit in their own
+patch files and can be offered upstream without it.
+
+`patches/chart-stack-posx.patch` — `compute_sizes_from_layout()` initialises the
+cursor that places chart stacks once, outside the per-stack loop, so every stack
+after the first starts where the previous one ended: at or past the right-hand
+edge, clipped into its neighbour. One statement, moved inside the loop. It cannot
+show on a wide terminal, where everything fits in a single stack, which is why it
+survived upstream. Applies to all four versions.
+
+`patches/nvtop-<version>-clock-percent-clamp.patch` — the clock chart plots a
+percentage of the maximum the backend reports:
+
+    data_val = gpu_clock_speed * 100 / gpu_clock_speed_max;
+
+and on this 7900 XT those two disagree by a third: the SMU reports 2894-2911 MHz
+under load while `max_engine_clk` — and `pp_dpm_sclk`, and everything else the
+driver exposes — caps at 2175 MHz. The card boosts above every maximum it
+advertises; `hwmon` has `freq1_input` but no `freq1_max`. Measured over 60 samples
+at full load: 109-133%, over 100 in every one of them.
+
+A percentage above 100 does not merely run off the top of the chart.
+`nvtop_line_plot()` maps a value to a row with `rows - round(data/increment)`,
+which is negative here, and stores it in an `unsigned`: 133% on a 20-row chart
+becomes 4294967289. The sample then looks like an enormous increase, the corner
+is drawn far outside the window (so nothing appears), and `mvwvline()` is asked
+for a four-billion-cell vertical line, which ncurses clips into a full-height bar.
+While the value stays above 100% every frame takes the "stayed level" branch and
+draws at row 4294967289 -- no line at all. That is the disconnected clock graph:
+the clock line vanishes whenever the card boosts, with stray bars where it
+crosses the 100% boundary.
+
+The temperature and power cases a few lines above already clamp exactly like
+this; the clock cases were missed. Two lines per case, and on this card the chart
+then shows the clock pinned at 100% while boosting -- on a 0-100 axis it cannot
+show more. One file per version: the surrounding case labels differ (3.1.0 and
+3.2.0 have no `eff. load` case after the memory clock), so a single file does not
+apply strictly to all four.
+
+Verified as an A/B: two builds of pristine 3.3.2 differing only in those four
+lines, run simultaneously on 136x65 pty pairs, with each chart line's colour
+counted inside the 7900's chart band by `tools/colour-screen.py`. Boosting at
+89-133%, the clock line had 17 cells in the unpatched build and 110 in the patched
+one, while the other three metrics moved by at most 11 cells: the line reappears,
+overdrawing the GPU% line drawn at the same 100% row. Idle, with nothing above the
+maximum, the two builds render identically -- 55 cells either way -- which is what
+the clamp is supposed to do.
 
 ## Stable-diffusion status
 
@@ -291,6 +345,9 @@ read, against 2 per 3 s when idle.
   live routers.
 - `tools/ansi-screen.py` — reconstructs a screen from a `script(1)`
   typescript, for inspecting what the TUI actually drew.
+- `tools/colour-screen.py` — the same, but keeping each cell's foreground colour,
+  so a single metric's line can be counted on its own: `--legend 'GPU1 clock%'`
+  names the colour that line is drawn in, `--mask N` prints only its cells.
 
 ## Limitations
 
