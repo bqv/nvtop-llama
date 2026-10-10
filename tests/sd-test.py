@@ -17,6 +17,8 @@ import http.server, json, os, re, subprocess, threading, urllib.parse
 PORT = 56003
 NVTOP = os.environ.get("NVTOP_BIN", "/home/user/tmp/nvtop/build-nv/src/nvtop")
 RAW = "/home/user/tmp/ui-sd.raw"
+FAKE = os.environ.get("FAKE_DIR", "/home/user/tmp/fakeload")
+DIFF = "/home/user/var/model/diff"
 LLM = "Qwen3.5-35B-A3B-abliterated-128k"
 STATE = {"progress": 0.42, "eta": 180.0, "step": 8, "steps": 20, "jobs": 1,
          "llm_loaded": False}
@@ -83,12 +85,34 @@ def main():
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-    # A job in flight but nothing sampled yet: the load. It must NOT be drawn as
-    # a 0% bar -- measured live, the card takes minutes to fill before step 1.
+    # A fake sd-server reading the real weights, so the /proc load scan has
+    # something true to measure. FAKELOAD_READY_BYTES is the pipe handshake.
     STATE.update(progress=0.0, step=0, steps=0, jobs=1, eta=0.0)
-    z = run("0. job accepted, still loading", {
+    files = ["Qwen_Image-Q4_K_M.gguf", "Qwen_Image-VAE.safetensors",
+             "Qwen2.5-VL-7B-Instruct-abliterated.Q5_K_M.gguf"]
+    args = [os.path.join(FAKE, "sd-server")]
+    for flag, f in zip(("--diffusion-model", "--vae", "--llm"), files):
+        args += [flag, os.path.join(DIFF, f)]
+    kid = subprocess.Popen(args, env={**os.environ, "FAKELOAD_READY_BYTES": str(1 << 30)},
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    kid.stdout.readline()
+    try:
+        l = run("0b. loading the weights", {
+            "LOAD bar drawn": lambda t: "LOAD[" in t,
+            "percentage from read_bytes over the model files":
+                lambda t: any(1 <= int(v) <= 99 for v in re.findall(r"LOAD\[[^\]]*\]\s+(\d+)%", t)),
+            "says loading": lambda t: "loading" in t,
+            "no DIFF bar while loading": lambda t: "DIFF[" not in t,
+        })
+    finally:
+        kid.kill()
+        kid.wait()
+
+    # Now the same state with no load signal available at all.
+    STATE.update(progress=0.0, step=0, steps=0, jobs=1, eta=0.0)
+    z = run("0. job accepted, no load signal available", {
         "no DIFF bar while loading": lambda t: "DIFF[" not in t,
-        "says it is loading": lambda t: "loading the model" in t,
+        "honest about having no progress": lambda t: "no progress reported" in t,
         "SD still owns the band": lambda t: "SD sd" in t,
     })
 
@@ -119,7 +143,7 @@ def main():
 
     srv.shutdown()
     bad = 0
-    for phase, res in (("0", z), ("1", a), ("2", b), ("3", c)):
+    for phase, res in (("0", z), ("0b", l), ("1", a), ("2", b), ("3", c)):
         for k, v in res.items():
             print(f"  [{'PASS' if v else 'FAIL'}] {phase}: {k}")
             bad += 0 if v else 1

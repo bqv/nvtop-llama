@@ -12,7 +12,7 @@ can be checked without a real request. Three phases:
 import http.server, json, os, re, subprocess, threading, urllib.parse
 
 PORT = 56002
-NVTOP = os.environ.get("NVTOP_BIN", "/home/user/tmp/nvtop/build-nv/src/nvtop")
+NVTOP = os.environ.get("NVTOP_BIN", "/home/user/tmp/patches-work/w332/build/src/nvtop")
 RAW = "/home/user/tmp/ui-prefill.raw"
 NAME = "Qwen3.5-35B-A3B-abliterated-128k"
 
@@ -79,6 +79,7 @@ def run(name, expect):
     env = dict(os.environ)
     env["NVTOP_LLM_SERVERS"] = f"stub=127.0.0.1:{PORT}=Radeon"
     env["TERM"] = "xterm-256color"
+    env["NVTOP_SD_SERVERS"] = "none=127.0.0.1:9=none"  # keep the real SD out of this suite
     env.pop("LINES", None)
     env.pop("COLUMNS", None)
     REQS.update(models=0, slots=0, metrics=0)

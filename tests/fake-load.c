@@ -27,9 +27,15 @@ int main(int argc, char **argv) {
   ssize_t n;
   unsigned long long total = 0;
 
-  for (int i = 1; i + 1 < argc; i++)
-    if (strcmp(argv[i], "--model") == 0)
-      path = argv[i + 1];
+  /* Also usable as a fake sd-server, which names its weights the same way. */
+  static const char *flags[] = {"--model", "--diffusion-model", "--vae", "--llm"};
+  const char *paths[4];
+  int npaths = 0;
+  for (int i = 1; i + 1 < argc && npaths < 4; i++)
+    for (unsigned f = 0; f < sizeof(flags) / sizeof(flags[0]); f++)
+      if (strcmp(argv[i], flags[f]) == 0)
+        paths[npaths++] = argv[i + 1];
+  path = npaths ? paths[0] : NULL;
   if (!path) {
     fprintf(stderr, "fake-load: no --model\n");
     return 2;
@@ -49,14 +55,23 @@ int main(int argc, char **argv) {
     const char *want = getenv("FAKELOAD_READY_BYTES");
     unsigned long long ready_at = want ? strtoull(want, NULL, 10) : (512ull << 20);
     int said = 0;
-    while ((n = read(fd, buf, blk)) > 0) {
-      total += (unsigned long long)n;
-      if (!said && total >= ready_at) {
-        printf("ready\n");
-        fflush(stdout);
-        said = 1;
+    for (int k = 0; k < npaths; k++) {
+      if (k > 0) {
+        fd = open(paths[k], O_RDONLY | O_DIRECT);
+        if (fd < 0)
+          continue;
       }
-      nanosleep(&pace, NULL);
+      while ((n = read(fd, buf, blk)) > 0) {
+        total += (unsigned long long)n;
+        if (!said && total >= ready_at) {
+          printf("ready\n");
+          fflush(stdout);
+          said = 1;
+        }
+        nanosleep(&pace, NULL);
+      }
+      if (k < npaths - 1)
+        close(fd);
     }
     if (!said) {
       printf("ready\n");

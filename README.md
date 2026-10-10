@@ -152,11 +152,21 @@ The details that matter:
    is one-way, appearing on the idle line where there is room. A GPU with only one
    of the two configured still gets the rows, because the reservation asks for
    *either*.
- - **A job in flight is not the same as sampling.** The model load comes first
-   and takes minutes, and the API reports `progress 0` throughout it, so that
-   state is shown as `loading the model, no progress reported by the API` rather
-   than as `DIFF 0%` -- which would claim it was diffusing when it was not. The
-   `DIFF` bar appears only once `progress` or `sampling_step` moves.
+ - **The load is trackable, the same way the llama load bar is.** The sd child
+   names every file it must load on its own command line (`--diffusion-model`,
+   `--vae`, `--llm`), so nvtop sums their sizes and watches `read_bytes` in
+   `/proc/<pid>/io`:
+
+       SD sd  Qwen_Image-Q4_K_M  loading
+       LOAD[||||||||          ] 42%  7.3/17.5 GiB
+
+   Measured at 97% of 17.48 GiB once loaded, the card reaching 12.35 GiB. This is
+   the minutes-long phase the sdapi document cannot see at all -- it reports
+   `progress 0` throughout, so drawing a bar from it would claim `DIFF 0%`.
+ - **A job in flight is not the same as sampling**, so the phase is named in words
+   on the name row: `loading` (weights still being read), `diffusing` (`progress`
+   or `sampling_step` moving), `working` (job in flight, weights in, nothing
+   reported -- the CPU text encoder sits here for ~80 s of a small job), `idle`.
  - Presence is reachability and nothing else: sd-server always names a checkpoint
    and reports progress 0 whether idle or unloaded (`/sdapi/v1/memory` is 404), so
    a server that does not answer is not shown at all and reserves no rows.

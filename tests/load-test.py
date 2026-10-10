@@ -8,9 +8,8 @@ real model. Two phases: a moving counter (percentage + rate) and a static one
 import glob, http.server, json, os, re, subprocess, sys, threading, urllib.parse
 
 PORT = 56001
-NVTOP = os.environ.get("NVTOP_BIN", "/home/user/tmp/nvtop/build-nv/src/nvtop")
-FAKE = os.environ.get("FAKE_DIR", "/home/user/tmp/fakeload")
-# Build the fixture first:  gcc -O2 -o "$FAKE_DIR/llama-server" tests/fake-load.c
+NVTOP = os.environ.get("NVTOP_BIN", "/home/user/tmp/patches-work/w332/build/src/nvtop")
+FAKE = "/home/user/tmp/fakeload"
 RAW = "/home/user/tmp/ui-load.raw"
 MODELS_DIR = "/home/user/var/model/llm"
 
@@ -46,6 +45,7 @@ def run_phase(name, model_arg, cwd, pause, expect):
     env = dict(os.environ)
     env["NVTOP_LLM_SERVERS"] = f"stub=127.0.0.1:{PORT}=Radeon"
     env["TERM"] = "xterm-256color"
+    env["NVTOP_SD_SERVERS"] = "none=127.0.0.1:9=none"  # keep the real SD out of this suite
     if pause: env["FAKELOAD_PAUSE"] = "1"
     env.pop("LINES", None); env.pop("COLUMNS", None)
 
