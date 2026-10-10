@@ -143,11 +143,15 @@ The details that matter:
    is a data URL of the image so far, and because the keys come out
    alphabetically it would sit in front of every field wanted and push them past
    the response buffer.
- - **The band is shared with the LLM meter, so the header never grows**:
-   whichever server is worth showing takes it -- diffusion while it is
-   generating, the router otherwise -- and while diffusion is merely idle its
-   checkpoint is noted on the router's own line. A GPU with only one of the two
-   configured still gets the rows, because the reservation asks for *either*.
+ - **The band is shared with the LLM meter, so the header never grows.** Which
+   server takes it follows what is actually on the card: a diffusion server that
+   is generating, then a router with a model loaded, then a reachable diffusion
+   server, then the router. That middle pair matters -- while a diffusion model is
+   resident the router is idle and unloaded, so diffusion keeps the top row even
+   between jobs and the router is noted on its line (`| LLM llama idle`). The note
+   is one-way, appearing on the idle line where there is room. A GPU with only one
+   of the two configured still gets the rows, because the reservation asks for
+   *either*.
  - There is no state for the model load, which is the slow part of a first
    generation, so it reads as idle rather than as a number invented here.
 

@@ -1,6 +1,6 @@
 diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_internal_common.h
---- a/include/nvtop/interface_internal_common.h	2026-10-10 12:05:27.452972140 +0300
-+++ b/include/nvtop/interface_internal_common.h	2026-10-10 12:05:27.458780347 +0300
+--- a/include/nvtop/interface_internal_common.h	2026-10-10 12:13:44.679110480 +0300
++++ b/include/nvtop/interface_internal_common.h	2026-10-10 12:13:44.684397659 +0300
 @@ -69,6 +69,7 @@
    WINDOW *shader_cores;
    WINDOW *l2_cache_size;
@@ -10,8 +10,8 @@ diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_
    bool dec_was_visible;
    nvtop_time last_decode_seen;
 diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface_layout_selection.h
---- a/include/nvtop/interface_layout_selection.h	2026-10-10 12:05:27.452972140 +0300
-+++ b/include/nvtop/interface_layout_selection.h	2026-10-10 12:05:27.458780347 +0300
+--- a/include/nvtop/interface_layout_selection.h	2026-10-10 12:13:44.679110480 +0300
++++ b/include/nvtop/interface_layout_selection.h	2026-10-10 12:13:44.684397659 +0300
 @@ -16,6 +16,7 @@
  void compute_sizes_from_layout(unsigned monitored_dev_count, unsigned device_header_rows, unsigned device_header_cols,
                                 unsigned rows, unsigned cols, const nvtop_interface_gpu_opts *gpu_opts,
@@ -22,7 +22,7 @@ diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface
                                 struct window_position *process_position, struct window_position *setup_position,
 diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 --- a/include/nvtop/model_meter_c.h	1970-01-01 02:00:00.000000000 +0200
-+++ b/include/nvtop/model_meter_c.h	2026-10-10 12:05:27.458780347 +0300
++++ b/include/nvtop/model_meter_c.h	2026-10-10 12:13:44.684397659 +0300
 @@ -0,0 +1,182 @@
 +/*
 + *
@@ -207,8 +207,8 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +
 +#endif /* NVTOP_MODEL_METER_C_H__ */
 diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
---- a/src/CMakeLists.txt	2026-10-10 12:05:27.453880182 +0300
-+++ b/src/CMakeLists.txt	2026-10-10 12:05:27.459757760 +0300
+--- a/src/CMakeLists.txt	2026-10-10 12:13:44.680153885 +0300
++++ b/src/CMakeLists.txt	2026-10-10 12:13:44.685434144 +0300
 @@ -16,6 +16,7 @@
    time.c
    plot.c
@@ -231,8 +231,8 @@ diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
    PRIVATE ncurses m ${CMAKE_DL_LIBS})
  
 diff -ruN a/src/interface.c b/src/interface.c
---- a/src/interface.c	2026-10-10 12:05:27.453880182 +0300
-+++ b/src/interface.c	2026-10-10 12:05:27.459757760 +0300
+--- a/src/interface.c	2026-10-10 12:13:44.680153885 +0300
++++ b/src/interface.c	2026-10-10 12:13:44.685434144 +0300
 @@ -28,6 +28,7 @@
  #include "nvtop/interface_options.h"
  #include "nvtop/interface_ring_buffer.h"
@@ -382,7 +382,7 @@ diff -ruN a/src/interface.c b/src/interface.c
    }
  
    alloc_process_with_option(dwin, process_position.posX, process_position.posY, process_position.sizeX,
-@@ -621,6 +703,427 @@
+@@ -621,6 +703,436 @@
    }
  }
  
@@ -564,7 +564,8 @@ diff -ruN a/src/interface.c b/src/interface.c
 + * load, which is the slow part, so that shows as idle rather than as a number
 + * invented here.
 + */
-+static void draw_sd_meter(WINDOW *win, const nvtop_sd_info *sd) {
++static void draw_sd_meter(WINDOW *win, const nvtop_sd_info *sd,
++                          const nvtop_model_meter_info *llm) {
 +  int rows, cols;
 +  char line[512], tail[192];
 +
@@ -606,6 +607,14 @@ diff -ruN a/src/interface.c b/src/interface.c
 +    llm_draw_bar(win, 1, cols, "DIFF", sd->progress_pct, tail);
 +  } else {
 +    snprintf(line, sizeof(line), "idle, no job in flight");
++    /* Mirror of the note the router draws: whichever server is on the second
++     * row still gets a mention. */
++    if (llm) {
++      if (llm->state == NVTOP_LLM_SERVER_DOWN)
++        llm_append(line, sizeof(line), "   | LLM %s not reachable", llm->server_name);
++      else
++        llm_append(line, sizeof(line), "   | LLM %s idle", llm->server_name);
++    }
 +    mvwprintw(win, 1, 0, "%.*s", cols - 1, line);
 +  }
 +  wnoutrefresh(win);
@@ -810,7 +819,7 @@ diff -ruN a/src/interface.c b/src/interface.c
  static void draw_devices(struct list_head *devices, struct nvtop_interface *interface) {
    struct gpu_info *device;
    unsigned dev_id = 0;
-@@ -860,6 +1363,28 @@
+@@ -860,6 +1372,32 @@
        wnoutrefresh(dev->exec_engines);
      }
  
@@ -822,16 +831,20 @@ diff -ruN a/src/interface.c b/src/interface.c
 +        llm = nvtop_model_meter_for_gpu(device->static_info.device_name);
 +        sd = nvtop_sd_meter_for_gpu(device->static_info.device_name);
 +      }
-+      /* One band per GPU, whichever server is worth showing: the diffusion
-+       * server takes it while it is generating (sampling is short and worth
-+       * watching), the router otherwise, and while diffusion is merely idle the
-+       * router's own line mentions its checkpoint. */
++      /* One band per GPU, ordered by what is actually on the card: a diffusion
++       * server that is generating, or that merely holds a checkpoint while the
++       * router has nothing loaded, matters more than an idle empty router --
++       * which is the normal state while a diffusion model is resident. */
 +      if (sd && sd->generating)
-+        draw_sd_meter(dev->llm_meter_win, sd);
++        draw_sd_meter(dev->llm_meter_win, sd, llm);
++      else if (llm && llm->loaded_count > 0)
++        draw_llm_meter(dev->llm_meter_win, llm, sd);
++      else if (sd && sd->reachable)
++        draw_sd_meter(dev->llm_meter_win, sd, llm);
 +      else if (llm)
 +        draw_llm_meter(dev->llm_meter_win, llm, sd);
 +      else if (sd)
-+        draw_sd_meter(dev->llm_meter_win, sd);
++        draw_sd_meter(dev->llm_meter_win, sd, NULL);
 +      else
 +        werase(dev->llm_meter_win);
 +    }
@@ -839,7 +852,7 @@ diff -ruN a/src/interface.c b/src/interface.c
      dev_id++;
    }
  }
-@@ -1797,6 +2322,9 @@
+@@ -1797,6 +2335,9 @@
  
  void draw_gpu_info_ncurses(unsigned devices_count, struct list_head *devices, struct nvtop_interface *interface) {
  
@@ -850,8 +863,8 @@ diff -ruN a/src/interface.c b/src/interface.c
    if (!interface->setup_win.visible) {
      draw_plots(interface);
 diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
---- a/src/interface_layout_selection.c	2026-10-10 12:05:27.453880182 +0300
-+++ b/src/interface_layout_selection.c	2026-10-10 12:05:27.459757760 +0300
+--- a/src/interface_layout_selection.c	2026-10-10 12:13:44.680153885 +0300
++++ b/src/interface_layout_selection.c	2026-10-10 12:13:44.685434144 +0300
 @@ -232,7 +232,8 @@
  }
  void compute_sizes_from_layout(unsigned devices_count, unsigned device_header_rows, unsigned device_header_cols,
@@ -911,7 +924,7 @@ diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
        headerPosX += device_header_cols + space_between_header_col;
 diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 --- a/src/llm_poller.c	1970-01-01 02:00:00.000000000 +0200
-+++ b/src/llm_poller.c	2026-10-10 12:05:27.461628007 +0300
++++ b/src/llm_poller.c	2026-10-10 12:13:44.685434144 +0300
 @@ -0,0 +1,1196 @@
 +/*
 + *
@@ -2110,8 +2123,8 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +  g_ready = false;
 +}
 diff -ruN a/src/nvtop.c b/src/nvtop.c
---- a/src/nvtop.c	2026-10-10 12:05:27.453880182 +0300
-+++ b/src/nvtop.c	2026-10-10 12:05:27.459757760 +0300
+--- a/src/nvtop.c	2026-10-10 12:13:44.680153885 +0300
++++ b/src/nvtop.c	2026-10-10 12:13:44.685434144 +0300
 @@ -24,6 +24,7 @@
  #include "nvtop/interface.h"
  #include "nvtop/interface_common.h"
