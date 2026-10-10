@@ -1,0 +1,18 @@
+--- a/src/interface_layout_selection.c
++++ b/src/interface_layout_selection.c
+@@ -337,6 +337,15 @@
+     unsigned num_plot_done = 0;
+     unsigned currentPosX = 0, currentPosY = rows_for_header;
+     for (unsigned stack_id = 0; stack_id < num_plot_stacks; ++stack_id) {
++      /*
++       * Each stack of charts occupies its own band of rows, so its first chart
++       * starts at the left edge. Without this reset every stack after the first
++       * is positioned where the previous stack ended -- past the right-hand edge
++       * -- which clips the charts and smears them into their neighbours. It
++       * never showed up on a wide terminal because everything fitted in one
++       * stack, i.e. this loop only ran once.
++       */
++      currentPosX = 0;
+       unsigned plot_in_this_stack = 0;
+       unsigned lines_to_draw = 0;
+       for (unsigned j = 0; j < *num_plots; ++j) {
