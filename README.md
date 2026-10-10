@@ -122,6 +122,39 @@ copies the two new files in and applies every edit by asserted anchor, so an
 unrecognised tree fails loudly instead of producing broken code. Then diff the
 result against the pristine tree to make the patch.
 
+## Stable-diffusion status
+
+`stable-diffusion.cpp`'s `sd-server` is not a router, but it speaks an
+A1111-shaped API, so its meter uses the same two rows:
+
+    SD sd  Qwen_Image-Q4_K_M
+    DIFF[||||||||||||||        ] 42%  step 8/20  eta 180s
+
+`GET /sdapi/v1/options` gives `sd_model_checkpoint`; `GET /sdapi/v1/progress`
+gives `progress`, `eta_relative` and `state.sampling_step` / `sampling_steps`.
+Servers are configured with `NVTOP_SD_SERVERS`, in the same
+`name=host:port=gpu-hint` shape as `NVTOP_LLM_SERVERS`:
+
+    NVTOP_SD_SERVERS="sd=127.0.0.1:55557=7900"
+
+The details that matter:
+
+ - `?skip_current_image=true` is always sent. While a job runs, `current_image`
+   is a data URL of the image so far, and because the keys come out
+   alphabetically it would sit in front of every field wanted and push them past
+   the response buffer.
+ - **The band is shared with the LLM meter, so the header never grows**:
+   whichever server is worth showing takes it -- diffusion while it is
+   generating, the router otherwise -- and while diffusion is merely idle its
+   checkpoint is noted on the router's own line. A GPU with only one of the two
+   configured still gets the rows, because the reservation asks for *either*.
+ - There is no state for the model load, which is the slow part of a first
+   generation, so it reads as idle rather than as a number invented here.
+
+Tested by `tests/sd-test.py` against a stub: while sampling, diffusion takes the
+band away from a router mapped to the same card; once idle the router gets it
+back and the checkpoint stays visible.
+
 ## Cold-load progress
 
 While a model is loading, the meter shows how far the load has got:
