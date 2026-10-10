@@ -52,7 +52,6 @@ applied by `eapply_user`, which `cmake.eclass` already calls:
 V=3.3.2
 P=/etc/portage/patches/sys-process/nvtop-$V
 sudo install -d "$P"
-sudo install -m 644 patches/chart-stack-posx.patch             "$P/chart-stack-posx.patch"
 sudo install -m 644 patches/nvtop-$V-clock-percent-clamp.patch "$P/clock-percent-clamp.patch"
 sudo install -m 644 patches/nvtop-$V-llama-meter.patch         "$P/llama-meter.patch"
 sudo emerge -1 --usepkg=n --getbinpkg=n nvtop
@@ -64,8 +63,8 @@ runs and this patch is skipped — with a normal-looking merge, exit 0, and no
 warning anywhere. Plain `emerge -1 nvtop` will silently hand you an unpatched
 binary. The tell is in the log: `* Applying user patches from
 /etc/portage/patches ...` then one line per patch, `* Applying
-chart-stack-posx.patch ...`, `clock-percent-clamp.patch`, `llama-meter.patch`. If
-those lines are absent, the patch did not go in.
+clock-percent-clamp.patch ...` then `* Applying llama-meter.patch ...`. If those
+lines are absent, the patch did not go in.
 
 Patches are version specific on purpose: `interface.c` differs by hundreds of
 lines between releases, so a single generic patch would fail to apply and break
@@ -126,17 +125,10 @@ copies the two new files in and applies every edit by asserted anchor, so an
 unrecognised tree fails loudly instead of producing broken code. Then diff the
 result against the pristine tree to make the patch.
 
-## Two fixes to nvtop's charts
+## A fix to nvtop's clock chart
 
-Both of these are bugs in nvtop rather than in the meter, so they sit in their own
-patch files and can be offered upstream without it.
-
-`patches/chart-stack-posx.patch` — `compute_sizes_from_layout()` initialises the
-cursor that places chart stacks once, outside the per-stack loop, so every stack
-after the first starts where the previous one ended: at or past the right-hand
-edge, clipped into its neighbour. One statement, moved inside the loop. It cannot
-show on a wide terminal, where everything fits in a single stack, which is why it
-survived upstream. Applies to all four versions.
+This is a bug in nvtop rather than in the meter, so it sits in its own patch file
+and can be offered upstream without the meter.
 
 `patches/nvtop-<version>-clock-percent-clamp.patch` — the clock chart plots a
 percentage of the maximum the backend reports:
@@ -175,6 +167,14 @@ one, while the other three metrics moved by at most 11 cells: the line reappears
 overdrawing the GPU% line drawn at the same 100% row. Idle, with nothing above the
 maximum, the two builds render identically -- 55 cells either way -- which is what
 the clamp is supposed to do.
+
+A second nvtop bug found on the way -- `compute_sizes_from_layout()` initialising
+the chart cursor once, outside the per-stack loop, so that every stack after the
+first was laid out starting where the previous one ended, off the right-hand edge
+-- was fixed here and has since been removed again at the owner's request. A stack
+only holds several charts on a wide terminal, and the one this is used on is 65
+columns wide, where the loop body runs once; the fix is still in the history if it
+is ever wanted back (`git log --oneline --grep='chart stack after the first'`).
 
 ## Stable-diffusion status
 
