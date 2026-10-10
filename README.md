@@ -4,6 +4,16 @@ LLM model meters for [nvtop](https://github.com/Syllo/nvtop): what model each
 llama.cpp router has loaded, how big it is, and how its context is doing —
 shown under the GPU that serves it.
 
+**This is a fork of [Syllo/nvtop](https://github.com/Syllo/nvtop).** `master` is
+upstream's history plus the changes below, so the fork builds as-is; the files in
+[`patches/`](patches/) describe those same changes against a *pristine* upstream
+tree, which is how they are applied on Gentoo.
+
+| what this fork adds | status |
+| --- | --- |
+| **LLM model meters** — what each llama.cpp router has loaded, how big it is, how full its context is, one line per loaded model, shown under the GPU that serves it | in this fork |
+| **Clock chart clamped to 100%** — a boosting GPU no longer erases the clock line | offered upstream on its own: [Syllo/nvtop#529](https://github.com/Syllo/nvtop/pull/529) |
+
 With the GT 1030 running two models at once:
 
 ```
@@ -128,7 +138,8 @@ result against the pristine tree to make the patch.
 ## A fix to nvtop's clock chart
 
 This is a bug in nvtop rather than in the meter, so it sits in its own patch file
-and can be offered upstream without the meter.
+and was offered upstream on its own, without the meter:
+[Syllo/nvtop#529](https://github.com/Syllo/nvtop/pull/529).
 
 `patches/nvtop-<version>-clock-percent-clamp.patch` — the clock chart plots a
 percentage of the maximum the backend reports:
@@ -163,10 +174,10 @@ Verified as an A/B: two builds of pristine 3.3.2 differing only in those four
 lines, run simultaneously on 136x65 pty pairs, with each chart line's colour
 counted inside the 7900's chart band by `tools/colour-screen.py`. Boosting at
 89-133%, the clock line had 17 cells in the unpatched build and 110 in the patched
-one, while the other three metrics moved by at most 11 cells: the line reappears,
-overdrawing the GPU% line drawn at the same 100% row. Idle, with nothing above the
-maximum, the two builds render identically -- 55 cells either way -- which is what
-the clamp is supposed to do.
+one. It reappears along the shared 100% row and overdraws the GPU% line drawn
+there, so GPU% falls from 116 cells to 42, while mem% and temp move by only 4 and
+11. Idle, with nothing above the maximum, the clock line is identical in both
+builds -- 55 cells either way -- which is what the clamp is supposed to do.
 
 A second nvtop bug found on the way -- `compute_sizes_from_layout()` initialising
 the chart cursor once, outside the per-stack loop, so that every stack after the
