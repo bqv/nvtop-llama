@@ -1,18 +1,18 @@
 # nvtop-llama
 
-LLM model meters for [nvtop](https://github.com/Syllo/nvtop): what model each
-llama.cpp router has loaded, how big it is, and how its context is doing —
-shown under the GPU that serves it.
-
-**This is a fork of [Syllo/nvtop](https://github.com/Syllo/nvtop).** `master` is
-upstream's history plus the changes below, so the fork builds as-is; the files in
+**A fork of [nvtop](https://github.com/Syllo/nvtop).** `master` is upstream's
+history plus the changes below, so it builds as-is; the files in
 [`patches/`](patches/) describe those same changes against a *pristine* upstream
-tree, which is how they are applied on Gentoo.
+tree, which is how they are applied on Gentoo. Upstream's own README is kept
+beside this one as [`NVTOP-README.markdown`](NVTOP-README.markdown).
+
+LLM model meters for nvtop: what model each llama.cpp router has loaded, how big
+it is, and how its context is doing — shown under the GPU that serves it.
 
 | what this fork adds | status |
 | --- | --- |
-| **LLM model meters** — what each llama.cpp router has loaded, how big it is, how full its context is, one line per loaded model, shown under the GPU that serves it | in this fork |
-| **Clock chart clamped to 100%** — a boosting GPU no longer erases the clock line | offered upstream on its own: [Syllo/nvtop#529](https://github.com/Syllo/nvtop/pull/529) |
+| **LLM model meters** — a line per loaded model, under the GPU serving it | in this fork |
+| **Clock chart clamped to 100%**, so a boosting GPU stops erasing the line | offered upstream: [Syllo/nvtop#529](https://github.com/Syllo/nvtop/pull/529) |
 
 With the GT 1030 running two models at once:
 
