@@ -3,8 +3,9 @@
 **A fork of [nvtop](https://github.com/Syllo/nvtop).** `master` is upstream's
 history plus the changes below, so it builds as-is; the files in
 [`patches/`](patches/) describe those same changes against a *pristine* upstream
-tree, which is how they are applied on Gentoo. Upstream's own README is kept
-beside this one as [`NVTOP-README.markdown`](NVTOP-README.markdown).
+tree, which is how they are applied on Gentoo. nvtop's own documentation — the
+command-line manual and the per-vendor notes — is upstream's
+[README.markdown](https://github.com/Syllo/nvtop/blob/master/README.markdown).
 
 LLM model meters for nvtop: what model each llama.cpp router has loaded, how big
 it is, and how its context is doing — shown under the GPU that serves it.
