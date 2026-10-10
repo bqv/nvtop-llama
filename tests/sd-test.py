@@ -83,6 +83,16 @@ def main():
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
+    # A job in flight but nothing sampled yet: the load. It must NOT be drawn as
+    # a 0% bar -- measured live, the card takes minutes to fill before step 1.
+    STATE.update(progress=0.0, step=0, steps=0, jobs=1, eta=0.0)
+    z = run("0. job accepted, still loading", {
+        "no DIFF bar while loading": lambda t: "DIFF[" not in t,
+        "says it is loading": lambda t: "loading the model" in t,
+        "SD still owns the band": lambda t: "SD sd" in t,
+    })
+
+    STATE.update(progress=0.42, step=8, steps=20, jobs=1, eta=180.0)
     a = run("1. SD sampling, router empty", {
         "diffusion takes the band": lambda t: "DIFF[" in t,
         "checkpoint from sd_model_checkpoint": lambda t: "Qwen_Image-Q4_K_M" in t,
@@ -101,15 +111,15 @@ def main():
     })
 
     STATE["llm_loaded"] = True
-    c = run("3. SD idle, router loaded -> router takes it", {
+    c = run("3. SD idle, router loaded -> router owns the band, SD still named", {
         "router owns the band": lambda t: f"LLM llama  {LLM}" in t,
-        "no SD note while the router is loaded": lambda t: "| SD" not in t,
+        "SD named on the router's line": lambda t: "| SD Qwen_Image-Q4_K_M idle" in t,
         "no DIFF bar": lambda t: "DIFF[" not in t,
     })
 
     srv.shutdown()
     bad = 0
-    for phase, res in (("1", a), ("2", b), ("3", c)):
+    for phase, res in (("0", z), ("1", a), ("2", b), ("3", c)):
         for k, v in res.items():
             print(f"  [{'PASS' if v else 'FAIL'}] {phase}: {k}")
             bad += 0 if v else 1

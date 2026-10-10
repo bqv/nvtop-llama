@@ -152,8 +152,14 @@ The details that matter:
    is one-way, appearing on the idle line where there is room. A GPU with only one
    of the two configured still gets the rows, because the reservation asks for
    *either*.
- - There is no state for the model load, which is the slow part of a first
-   generation, so it reads as idle rather than as a number invented here.
+ - **A job in flight is not the same as sampling.** The model load comes first
+   and takes minutes, and the API reports `progress 0` throughout it, so that
+   state is shown as `loading the model, no progress reported by the API` rather
+   than as `DIFF 0%` -- which would claim it was diffusing when it was not. The
+   `DIFF` bar appears only once `progress` or `sampling_step` moves.
+ - Presence is reachability and nothing else: sd-server always names a checkpoint
+   and reports progress 0 whether idle or unloaded (`/sdapi/v1/memory` is 404), so
+   a server that does not answer is not shown at all and reserves no rows.
 
 Tested by `tests/sd-test.py` against a stub: while sampling, diffusion takes the
 band away from a router mapped to the same card; once idle the router gets it

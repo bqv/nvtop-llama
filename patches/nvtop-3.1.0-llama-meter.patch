@@ -1,6 +1,6 @@
 diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_internal_common.h
---- a/include/nvtop/interface_internal_common.h	2026-10-10 12:13:44.284219521 +0300
-+++ b/include/nvtop/interface_internal_common.h	2026-10-10 12:13:44.289351776 +0300
+--- a/include/nvtop/interface_internal_common.h	2026-10-10 13:49:57.302669310 +0300
++++ b/include/nvtop/interface_internal_common.h	2026-10-10 13:49:57.317199995 +0300
 @@ -68,6 +68,7 @@
    WINDOW *shader_cores;
    WINDOW *l2_cache_size;
@@ -10,8 +10,8 @@ diff -ruN a/include/nvtop/interface_internal_common.h b/include/nvtop/interface_
    bool dec_was_visible;
    nvtop_time last_decode_seen;
 diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface_layout_selection.h
---- a/include/nvtop/interface_layout_selection.h	2026-10-10 12:13:44.284219521 +0300
-+++ b/include/nvtop/interface_layout_selection.h	2026-10-10 12:13:44.289351776 +0300
+--- a/include/nvtop/interface_layout_selection.h	2026-10-10 13:49:57.302669310 +0300
++++ b/include/nvtop/interface_layout_selection.h	2026-10-10 13:49:57.317199995 +0300
 @@ -16,6 +16,7 @@
  void compute_sizes_from_layout(unsigned monitored_dev_count, unsigned device_header_rows, unsigned device_header_cols,
                                 unsigned rows, unsigned cols, const nvtop_interface_gpu_opts *gpu_opts,
@@ -22,7 +22,7 @@ diff -ruN a/include/nvtop/interface_layout_selection.h b/include/nvtop/interface
                                 struct window_position *process_position, struct window_position *setup_position);
 diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 --- a/include/nvtop/model_meter_c.h	1970-01-01 02:00:00.000000000 +0200
-+++ b/include/nvtop/model_meter_c.h	2026-10-10 12:13:44.289351776 +0300
++++ b/include/nvtop/model_meter_c.h	2026-10-10 13:49:57.317199995 +0300
 @@ -0,0 +1,182 @@
 +/*
 + *
@@ -207,8 +207,8 @@ diff -ruN a/include/nvtop/model_meter_c.h b/include/nvtop/model_meter_c.h
 +
 +#endif /* NVTOP_MODEL_METER_C_H__ */
 diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
---- a/src/CMakeLists.txt	2026-10-10 12:13:44.285189128 +0300
-+++ b/src/CMakeLists.txt	2026-10-10 12:13:44.290307500 +0300
+--- a/src/CMakeLists.txt	2026-10-10 13:49:57.308169069 +0300
++++ b/src/CMakeLists.txt	2026-10-10 13:49:57.318064817 +0300
 @@ -16,6 +16,7 @@
    time.c
    plot.c
@@ -231,8 +231,8 @@ diff -ruN a/src/CMakeLists.txt b/src/CMakeLists.txt
    PRIVATE ncurses m ${CMAKE_DL_LIBS})
  
 diff -ruN a/src/interface.c b/src/interface.c
---- a/src/interface.c	2026-10-10 12:13:44.285189128 +0300
-+++ b/src/interface.c	2026-10-10 12:13:44.290307500 +0300
+--- a/src/interface.c	2026-10-10 13:49:57.311398150 +0300
++++ b/src/interface.c	2026-10-10 13:49:57.318064817 +0300
 @@ -29,6 +29,7 @@
  #include "nvtop/interface_options.h"
  #include "nvtop/interface_ring_buffer.h"
@@ -382,7 +382,7 @@ diff -ruN a/src/interface.c b/src/interface.c
    }
  
    alloc_process_with_option(dwin, process_position.posX, process_position.posY, process_position.sizeX,
-@@ -619,6 +701,436 @@
+@@ -619,6 +701,461 @@
    }
  }
  
@@ -453,9 +453,31 @@ diff -ruN a/src/interface.c b/src/interface.c
 +    llm_append(out, cap, "  kv %s/%s", m->kv_type_k, m->kv_type_v);
 +}
 +
++/*
++ * What the diffusion server is actually doing. A job being in flight is NOT the
++ * same as it sampling: the model load comes first and takes minutes, during
++ * which the API reports progress 0 and sampling_step 0 -- showing that as
++ * "DIFF 0%" would claim it is diffusing when it is still loading.
++ */
++static const char *sd_phase_word(const nvtop_sd_info *sd) {
++  if (sd->progress_pct > 0 || sd->step > 0)
++    return "diffusing";
++  if (sd->job_count > 0)
++    return "loading";
++  return "idle";
++}
++
++/* Presence note for the diffusion server, for when the router owns the band: a
++ * live sd-server is worth naming even while it is idle. */
++static void llm_sd_note(char *out, size_t cap, const nvtop_sd_info *sd) {
++  if (sd && sd->checkpoint[0])
++    llm_append(out, cap, "   | SD %s %s", sd->checkpoint, sd_phase_word(sd));
++}
++
 +/* Live KV-cache load bar, drawn like the GPU/MEM meters. */
-+static void llm_draw_ctx_bar(WINDOW *win, int row, int cols, const nvtop_llm_model *m) {
-+  char pct[16], tail[128];
++static void llm_draw_ctx_bar(WINDOW *win, int row, int cols, const nvtop_llm_model *m,
++                             const nvtop_sd_info *sd) {
++  char pct[16], tail[192];
 +  int label = 4, bar, filled;
 +
 +  snprintf(pct, sizeof(pct), "%u%%", m->kv_usage_pct);
@@ -464,6 +486,7 @@ diff -ruN a/src/interface.c b/src/interface.c
 +             (unsigned long long)m->kv_tokens_total);
 +  else
 +    snprintf(tail, sizeof(tail), " %s", pct);
++  llm_sd_note(tail, sizeof(tail), sd);
 +
 +  bar = cols - label - 3 - (int)strlen(tail);
 +  if (bar < 1)
@@ -580,9 +603,7 @@ diff -ruN a/src/interface.c b/src/interface.c
 +
 +  line[0] = '\0';
 +  llm_append(line, sizeof(line), " %s", sd->server_name);
-+  if (!sd->reachable)
-+    llm_append(line, sizeof(line), "  not reachable");
-+  else if (sd->checkpoint[0])
++  if (sd->checkpoint[0])
 +    llm_append(line, sizeof(line), "  %s", sd->checkpoint);
 +  else
 +    llm_append(line, sizeof(line), "  no checkpoint reported");
@@ -593,10 +614,7 @@ diff -ruN a/src/interface.c b/src/interface.c
 +    return;
 +  }
 +
-+  if (!sd->reachable) {
-+    snprintf(line, sizeof(line), "nothing answered on the sd socket");
-+    mvwprintw(win, 1, 0, "%.*s", cols - 1, line);
-+  } else if (sd->generating) {
++  if (sd->progress_pct > 0 || sd->step > 0) {
 +    snprintf(tail, sizeof(tail), " %u%%", sd->progress_pct);
 +    if (sd->steps)
 +      llm_append(tail, sizeof(tail), "  step %u/%u", sd->step, sd->steps);
@@ -605,6 +623,10 @@ diff -ruN a/src/interface.c b/src/interface.c
 +    if (sd->eta_s > 0.0)
 +      llm_append(tail, sizeof(tail), "  eta %.0fs", sd->eta_s);
 +    llm_draw_bar(win, 1, cols, "DIFF", sd->progress_pct, tail);
++  } else if (sd->job_count > 0) {
++    /* Job accepted, nothing sampled yet. The card is filling with weights. */
++    snprintf(line, sizeof(line), "loading the model, no progress reported by the API");
++    mvwprintw(win, 1, 0, "%.*s", cols - 1, line);
 +  } else {
 +    snprintf(line, sizeof(line), "idle, no job in flight");
 +    /* Mirror of the note the router draws: whichever server is on the second
@@ -768,10 +790,13 @@ diff -ruN a/src/interface.c b/src/interface.c
 +      /* A prompt being read is more interesting than how full the window is. */
 +      llm_draw_prefill_bar(win, 1, cols, info->server_name, m);
 +    } else if (m->has_live_ctx) {
-+      llm_draw_ctx_bar(win, 1, cols, m);
++      llm_draw_ctx_bar(win, 1, cols, m, sd);
 +    } else {
 +      llm_model_facts(m, facts, sizeof(facts), true);
-+      mvwprintw(win, 1, 0, "%.*s", cols - 1, facts[0] ? facts : "model loaded");
++      if (!facts[0])
++        snprintf(facts, sizeof(facts), "model loaded");
++      llm_sd_note(facts, sizeof(facts), sd);
++      mvwprintw(win, 1, 0, "%.*s", cols - 1, facts);
 +    }
 +    wnoutrefresh(win);
 +    return;
@@ -819,7 +844,7 @@ diff -ruN a/src/interface.c b/src/interface.c
  static void draw_devices(struct list_head *devices, struct nvtop_interface *interface) {
    struct gpu_info *device;
    unsigned dev_id = 0;
-@@ -840,6 +1352,32 @@
+@@ -840,6 +1377,29 @@
        wnoutrefresh(dev->exec_engines);
      }
  
@@ -831,20 +856,17 @@ diff -ruN a/src/interface.c b/src/interface.c
 +        llm = nvtop_model_meter_for_gpu(device->static_info.device_name);
 +        sd = nvtop_sd_meter_for_gpu(device->static_info.device_name);
 +      }
-+      /* One band per GPU, ordered by what is actually on the card: a diffusion
-+       * server that is generating, or that merely holds a checkpoint while the
-+       * router has nothing loaded, matters more than an idle empty router --
-+       * which is the normal state while a diffusion model is resident. */
++      /* One band per GPU, ordered by what is actually on the card. `sd` is NULL
++       * unless the diffusion service answered, so an absent one is never
++       * advertised and never reserves a row. */
 +      if (sd && sd->generating)
 +        draw_sd_meter(dev->llm_meter_win, sd, llm);
 +      else if (llm && llm->loaded_count > 0)
 +        draw_llm_meter(dev->llm_meter_win, llm, sd);
-+      else if (sd && sd->reachable)
++      else if (sd)
 +        draw_sd_meter(dev->llm_meter_win, sd, llm);
 +      else if (llm)
 +        draw_llm_meter(dev->llm_meter_win, llm, sd);
-+      else if (sd)
-+        draw_sd_meter(dev->llm_meter_win, sd, NULL);
 +      else
 +        werase(dev->llm_meter_win);
 +    }
@@ -852,7 +874,7 @@ diff -ruN a/src/interface.c b/src/interface.c
      dev_id++;
    }
  }
-@@ -1764,6 +2302,9 @@
+@@ -1764,6 +2324,9 @@
  
  void draw_gpu_info_ncurses(unsigned devices_count, struct list_head *devices, struct nvtop_interface *interface) {
  
@@ -863,8 +885,8 @@ diff -ruN a/src/interface.c b/src/interface.c
    if (!interface->setup_win.visible) {
      draw_plots(interface);
 diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
---- a/src/interface_layout_selection.c	2026-10-10 12:13:44.285189128 +0300
-+++ b/src/interface_layout_selection.c	2026-10-10 12:13:44.290307500 +0300
+--- a/src/interface_layout_selection.c	2026-10-10 13:49:57.311398150 +0300
++++ b/src/interface_layout_selection.c	2026-10-10 13:49:57.318064817 +0300
 @@ -233,7 +233,8 @@
  
  void compute_sizes_from_layout(unsigned devices_count, unsigned device_header_rows, unsigned device_header_cols,
@@ -924,8 +946,8 @@ diff -ruN a/src/interface_layout_selection.c b/src/interface_layout_selection.c
        headerPosX += device_header_cols + space_between_header_col;
 diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 --- a/src/llm_poller.c	1970-01-01 02:00:00.000000000 +0200
-+++ b/src/llm_poller.c	2026-10-10 12:13:44.290307500 +0300
-@@ -0,0 +1,1196 @@
++++ b/src/llm_poller.c	2026-10-10 13:49:57.318064817 +0300
+@@ -0,0 +1,1208 @@
 +/*
 + *
 + * Copyright (C) 2025 DSH User
@@ -2067,24 +2089,36 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +  g_sd_ready = true;
 +}
 +
++/*
++ * A service that does not answer is not advertised at all -- no line, no note,
++ * and no rows reserved for it. For sd-server "loaded" IS reachability: it always
++ * names a checkpoint and reports progress 0 whether it is idle or unloaded, so
++ * /sdapi/v1/memory does not exist (404) and there is nothing else to ask.
++ *
++ * This is polled state, so it is false until the first poll completes. A GPU
++ * whose only server is sd therefore needs the layout recomputed (a resize) after
++ * the service comes up; where a router shares the card the band is already there.
++ */
 +bool nvtop_sd_meter_has_server_for_gpu(const char *gpu_name) {
 +  sd_servers_init();
-+  if (!gpu_name || !gpu_name[0])
++  if (!g_sd_ready || !gpu_name || !gpu_name[0])
 +    return false;
 +  for (unsigned i = 0; i < g_sd_def_count && i < NVTOP_SD_MAX_SERVERS; i++)
-+    if (g_sd_defs[i].gpu_hint[0] && contains_nocase(gpu_name, g_sd_defs[i].gpu_hint))
++    if (g_sd[i].reachable && g_sd_defs[i].gpu_hint[0] &&
++        contains_nocase(gpu_name, g_sd_defs[i].gpu_hint))
 +      return true;
 +  return false;
 +}
 +
-+/* Returns the configured server for this GPU whether or not it answers, so the
-+ * UI can say "not reachable" rather than showing nothing at all. */
++/* NULL unless the service answered: callers then take the router's path and an
++ * absent sd-server simply does not appear. */
 +const nvtop_sd_info *nvtop_sd_meter_for_gpu(const char *gpu_name) {
 +  sd_servers_init();
 +  if (!g_sd_ready || !gpu_name || !gpu_name[0])
 +    return NULL;
 +  for (unsigned i = 0; i < g_sd_def_count && i < NVTOP_SD_MAX_SERVERS; i++)
-+    if (g_sd_defs[i].gpu_hint[0] && contains_nocase(gpu_name, g_sd_defs[i].gpu_hint))
++    if (g_sd[i].reachable && g_sd_defs[i].gpu_hint[0] &&
++        contains_nocase(gpu_name, g_sd_defs[i].gpu_hint))
 +      return &g_sd[i];
 +  return NULL;
 +}
@@ -2123,8 +2157,8 @@ diff -ruN a/src/llm_poller.c b/src/llm_poller.c
 +  g_ready = false;
 +}
 diff -ruN a/src/nvtop.c b/src/nvtop.c
---- a/src/nvtop.c	2026-10-10 12:13:44.285189128 +0300
-+++ b/src/nvtop.c	2026-10-10 12:13:44.290307500 +0300
+--- a/src/nvtop.c	2026-10-10 13:49:57.311398150 +0300
++++ b/src/nvtop.c	2026-10-10 13:49:57.318064817 +0300
 @@ -34,6 +34,7 @@
  #include "nvtop/interface.h"
  #include "nvtop/interface_common.h"
