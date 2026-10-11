@@ -275,37 +275,73 @@ child does real `O_DIRECT` reads of a GGUF. No model server is involved.
 
 ## Prefill progress
 
-While a request's prompt is being read, the same line shows how much of it has
-been processed:
+While a request's prompt is being read, the row shows what the router had to
+compute and what it reused:
 
     LLM llama  Qwen3.5-35B-A3B-abliterated-128k
-    PREF[||||||||||||||||||||||||||||||||||||        ] 95%  41.4k/43.5k tokens  3.1k tok/s  eta 1s
+    PREF[========================================||||||||||||||||       ] 75%  6.1k/34.2k tokens  7.7k cached  119 tok/s
 
-Unlike the load bar this is not inferred -- the router reports it directly.
+The cached prefix is drawn as `=` in its own colour and the part actually being
+computed as `|`. Most of a warm session's prompt is usually already in the
+router's cache -- one measured request had 23,636 cached tokens against 2,858 to
+compute -- so a single-colour bar measured against the whole prompt would sit near
+0% while the card worked flat out. The two characters also keep the regions apart
+on a terminal with one colour, or none.
+
+### The percentage is an estimate, and why
+
 `GET /slots?model=<id>` (on a router `?model=` is required; bare `/slots` answers
-HTTP 400) returns the slot handling the task with `n_prompt_tokens` and
-`n_prompt_tokens_processed`, and the percentage is their ratio.
+HTTP 400) reports three counters, and **none of them is the prompt length**:
 
-The details that decide whether the figure is honest:
+| field | what it actually is |
+| --- | --- |
+| `n_prompt_tokens_processed` | tokens the router **evaluated**; a prompt served from cache leaves this near zero |
+| `n_prompt_tokens_cache` | tokens reused from the prompt cache |
+| `n_prompt_tokens` | `processed + cache + one batch` -- **consumed so far, not a total** |
 
- - `is_processing` is true during decode too, when `processed == total`. The bar
-   therefore appears only while a prompt is still being read; when it finishes the
-   context bar takes the line back, rather than a bar frozen at 100%.
- - `n_prompt_tokens_cache` is shown when non-zero, so a prompt that was mostly
-   reused from cache reads as a cache hit rather than as suspiciously instant.
- - Every slot is examined, not just the first, since with `--parallel > 1` the
-   first may be idle while a later one is working.
- - `id_task` changes with each request and resets the rate, so a new prompt cannot
-   inherit the previous one's tokens/s. Rate and ETA come from the delta between
-   polls, not from timing the bar.
+That last one is the trap: it looks like the prompt length and is not. Dividing by
+it slides to 100% on its own -- the old `processed / total` bar read 77% where the
+router's own log said 93% -- and with a large cache hit it sits near 0%. The router
+does know the real length (it prints `progress = 0.93` in its log) but exposes it
+in no endpoint: `/metrics` carries only cumulative counters and `/props` only
+generation settings.
+
+The percentage is therefore measured against **the sequence length this model
+reached the last time it was generating**, which is the one usable proxy, because a
+chat request's prompt contains all of that context. It is a lower bound: measured
+at 34,216 against a true 37,850 here, so the bar runs about 10% ahead and finishes
+slightly early rather than never. Before a model has generated once there is no
+estimate, and the row shows the counts with no percentage at all.
+
+### Decode gets its own row
+
+`is_processing` stays true while generating, so the prompt counters alone cannot
+say which phase a model is in. `next_token.n_decoded` can: during decode
+`n_prompt_tokens` is the whole *sequence*, growing by one per generated token,
+while `n_prompt_tokens_processed` stays where the prompt left it. The old
+`processed >= total` test therefore never fired on a cache-served prompt, and the
+prefill bar latched on at ~0% for an entire generation -- one measured run lasted
+16.6 minutes and produced 10,581 tokens with nothing useful on screen.
+
+Generating has a bar of its own:
+
+    GEN [||||] 5%  3.4k gen  11 tok/s  62.0k left  ctx 75%
+
+The fill is the share of the generation allowance the router reports (`n_decoded`
+against `n_decoded + n_remain`). `left` is that allowance and **not a forecast**:
+one measured request reported 54,981 remaining two seconds before it stopped at
+EOS. The live figures are the rate and the count; the context percentage rides in
+the tail so the window fill is not lost along with its own bar.
 
 That one row is chosen by what the model is doing: the load bar while it is
-loading, the prefill bar while a prompt is being read, otherwise the context bar
-or the static facts. **No extra rows are used** -- the meter band is exactly as
-tall as it was.
+loading, the prefill bar while a prompt is being read, the decode bar while it is
+generating, otherwise the context bar or the static facts. **No extra rows are
+used** -- the meter band is exactly as tall as it was.
 
-Tested by `tests/prefill-test.py`: four phases against a stub router (prefill in
-flight, prompt finished, mostly-cached prompt, loaded but idle), one of which
+Tested by `tests/prefill-test.py`, which runs seven phases against a stub router: a
+warm-up decode to establish the length estimate, prefill in flight, a finished
+prompt that reports no `next_token`, a mostly-cached prompt, the cache-heavy
+already-generating case above, plain generation, and loaded-but-idle. One of them
 serves whitespace-separated JSON so the parser stays tolerant of that.
 
 ### Why the bar is eased

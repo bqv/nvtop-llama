@@ -158,12 +158,15 @@ def gap_fix(target, variant):
                  "dwin->options.process_fields_displayed, device_extra_rows, device_positions, &dwin->num_plots, plot_positions,",
                  "helper call")
     t = sub_once(t, "static void initialize_all_windows(struct nvtop_interface *dwin) {",
-                 "/* True when a router is configured for this GPU. Independent of the poll, so it\n"
-                 " * can be asked while the layout is being computed. */\n"
-                 "static bool gpu_has_llm_router(struct nvtop_interface *dwin, unsigned dev_id) {\n"
+                 "/* True when a meter is configured for this GPU -- an LLM router or a\n"
+                 " * stable-diffusion server. Independent of the poll, so it can be asked while\n"
+                 " * the layout is being computed. */\n"
+                 "static bool gpu_has_meter(struct nvtop_interface *dwin, unsigned dev_id) {\n"
                  "  struct gpu_info *gpu = dwin->options.gpu_specific_opts[dev_id].linkedGpu;\n"
-                 "  return gpu && GPUINFO_STATIC_FIELD_VALID(&gpu->static_info, device_name) &&\n"
-                 "         nvtop_model_meter_has_router_for_gpu(gpu->static_info.device_name);\n"
+                 "  if (!gpu || !GPUINFO_STATIC_FIELD_VALID(&gpu->static_info, device_name))\n"
+                 "    return false;\n"
+                 "  return nvtop_model_meter_has_router_for_gpu(gpu->static_info.device_name) ||\n"
+                 "         nvtop_sd_meter_has_server_for_gpu(gpu->static_info.device_name);\n"
                  "}\n\nstatic void initialize_all_windows(struct nvtop_interface *dwin) {", "router helper")
 
     rows_expr = "device_rows" if variant == "master" else "base_header_rows"
@@ -182,8 +185,9 @@ def gap_fix(target, variant):
 
     t = sub_once(t, "  unsigned int llm_rows = 0;\n  unsigned int baseline_plots;",
                  "  unsigned int baseline_plots;\n\n"
-                 "  /* Meter rows are reserved per GPU, and only for GPUs that have a router: one\n"
-                 "   * without one reserves nothing, so it cannot leave a blank band behind. */\n"
+                 "  /* Meter rows are reserved per GPU, and only for GPUs that have a server\n"
+                 "   * (router or diffusion): one without reserves nothing, so it cannot leave a\n"
+                 "   * blank band behind. */\n"
                  "  unsigned int device_extra_rows[devices_count];\n"
                  "  for (unsigned int i = 0; i < devices_count; ++i)\n    device_extra_rows[i] = 0;",
                  "extras array")
@@ -194,7 +198,7 @@ def gap_fix(target, variant):
                     "      llm_rows = candidate;\n      break;\n    }\n  }",
                  "  for (unsigned int candidate = llm_rows_pref;; candidate--) {\n"
                  "    for (unsigned int i = 0; i < devices_count; ++i)\n"
-                 "      device_extra_rows[i] = gpu_has_llm_router(dwin, i) ? candidate : 0;\n"
+                 "      device_extra_rows[i] = gpu_has_meter(dwin, i) ? candidate : 0;\n"
                  "    compute_layout_for_interface(dwin, devices_count, " + rows_expr + ", rows, cols, device_extra_rows, device_positions,\n"
                  "                                 plot_positions, map_device_to_plot, &process_position, &setup_position);\n"
                  "    if (candidate == 0 || (dwin->num_plots >= baseline_plots && plot_area_rows(plot_positions, dwin->num_plots) >= 7))\n"
@@ -206,7 +210,19 @@ def gap_fix(target, variant):
                  "                               plot_positions, map_device_to_plot, &process_position, &setup_position);\n"
                  "  baseline_plots = dwin->num_plots;", "baseline call")
     t = sub_once(t, alloc_call_old, alloc_call_new, "alloc call")
-    band_old_commented = """      if (llm) {
+    # What port.py itself generated (no braces), versus what replaces it.
+    band_old_head = """      const nvtop_model_meter_info *llm = NULL;
+      if (GPUINFO_STATIC_FIELD_VALID(&device->static_info, device_name))
+        llm = nvtop_model_meter_for_gpu(device->static_info.device_name);
+"""
+    band_new_head = """      const nvtop_model_meter_info *llm = NULL;
+      const nvtop_sd_info *sd = NULL;
+      if (GPUINFO_STATIC_FIELD_VALID(&device->static_info, device_name)) {
+        llm = nvtop_model_meter_for_gpu(device->static_info.device_name);
+        sd = nvtop_sd_meter_for_gpu(device->static_info.device_name);
+      }
+"""
+    band_old_commented = band_old_head + """      if (llm) {
         draw_llm_meter(dev->llm_meter_win, llm);
       } else {
         /* No LLM router is mapped to this GPU (e.g. the iGPU driving the
@@ -218,7 +234,7 @@ def gap_fix(target, variant):
         mvwprintw(dev->llm_meter_win, 0, 3, " -");
         wnoutrefresh(dev->llm_meter_win);
       }"""
-    band_old_plain = """      if (llm) {
+    band_old_plain = band_old_head + """      if (llm) {
         draw_llm_meter(dev->llm_meter_win, llm);
       } else {
         werase(dev->llm_meter_win);
@@ -228,8 +244,17 @@ def gap_fix(target, variant):
         mvwprintw(dev->llm_meter_win, 0, 3, " -");
         wnoutrefresh(dev->llm_meter_win);
       }"""
-    band_new = """      if (llm)
-        draw_llm_meter(dev->llm_meter_win, llm);
+    band_new = band_new_head + """      /* One band per GPU, ordered by what is actually on the card. `sd` is NULL
+       * unless the diffusion service answered, so an absent one is never
+       * advertised and never reserves a row. */
+      if (sd && sd->generating)
+        draw_sd_meter(dev->llm_meter_win, sd, llm);
+      else if (llm && llm->loaded_count > 0)
+        draw_llm_meter(dev->llm_meter_win, llm, sd);
+      else if (sd)
+        draw_sd_meter(dev->llm_meter_win, sd, llm);
+      else if (llm)
+        draw_llm_meter(dev->llm_meter_win, llm, sd);
       else
         werase(dev->llm_meter_win);"""
     if t.count(band_old_commented) == 1:
