@@ -14,6 +14,21 @@ it is, and how its context is doing — shown under the GPU that serves it.
 | --- | --- |
 | **LLM model meters** — a line per loaded model, under the GPU serving it | in this fork |
 | **Clock chart clamped to 100%**, so a boosting GPU stops erasing the line | offered upstream: [Syllo/nvtop#529](https://github.com/Syllo/nvtop/pull/529) |
+| **Intel GPU heap leak fixed** — nvtop built and threw away four libudev devices *per refresh*, growing its heap ~20 MB/hour (≈1 GB per two days) for as long as it ran | in this fork (3.2.0, 3.3.2, 9999) |
+
+The leak is upstream's, not the meter's: `gpuinfo_intel_refresh_dynamic_info()`
+re-created its udev devices every refresh to defeat libudev's attribute cache,
+and the property strings and hashmap buckets those devices allocate are not fully
+released on unref. Measured natively, nvtop leaked **~69 blocks/second** of ~78
+bytes. The fix reads the sysfs attributes directly instead — always current, and
+allocation-free — and keeps the udev devices only for structural queries.
+
+| version | leak patch | verified |
+| --- | --- | --- |
+| 3.1.0 | not needed (no such code) | — |
+| 3.2.0 | [`nvtop-3.2.0-intel-udev-leak.patch`](patches/nvtop-3.2.0-intel-udev-leak.patch) | applies and builds |
+| 3.3.2 | [`nvtop-3.3.2-intel-udev-leak.patch`](patches/nvtop-3.3.2-intel-udev-leak.patch) | **measured flat** (0.0 MB/hour vs 20.1 unpatched) |
+| 9999 | [`nvtop-9999-intel-udev-leak.patch`](patches/nvtop-9999-intel-udev-leak.patch) | applies and builds |
 
 With the GT 1030 running two models at once:
 
